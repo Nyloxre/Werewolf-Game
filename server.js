@@ -3,7 +3,7 @@
 // Requires: npm install ws
 
 const WebSocket = require('ws');
-const wss = new WebSocket.Server({ port: process.env.PORT || 8080 });
+const wss = new WebSocket.Server({ port: process.env.PORT || 10000 });
 
 const rooms = {}; // roomCode -> roomState
 
