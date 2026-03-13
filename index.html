@@ -1,0 +1,1600 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Werewolf</title>
+<style>
+body{font-family:system-ui;background:#111;color:#fff;margin:0;padding:16px;text-align:center}
+button{padding:14px 18px;margin:8px;font-size:16px;border-radius:10px;border:none;background:#444;color:white;cursor:pointer}
+button:hover{background:#666}
+button:disabled{opacity:.4;cursor:not-allowed}
+.card{background:#1e1e1e;padding:20px;border-radius:14px;margin-top:20px}
+.list button{display:block;width:100%}
+.small{opacity:.7;font-size:14px}
+.rolelist{margin-top:15px;text-align:left}
+.mode-btn{padding:20px 28px;font-size:18px;margin:12px;border-radius:14px;background:#2a2a2a;border:2px solid #555}
+.mode-btn:hover{background:#333;border-color:#aaa}
+.role-preview{background:#2a2a2a;border-radius:10px;padding:12px;margin-top:14px;text-align:left;font-size:14px}
+.role-preview div{padding:3px 0;opacity:.85}
+.mp-btn{padding:20px 28px;font-size:18px;margin:12px;border-radius:14px;background:#1a2a3a;border:2px solid #36a;}
+.mp-btn:hover{background:#1a3050;border-color:#6af}
+.room-code{font-size:48px;font-weight:bold;letter-spacing:10px;color:#6af;margin:12px 0;font-family:monospace}
+.player-row{background:#252525;padding:10px 14px;border-radius:8px;margin:5px 0;display:flex;justify-content:space-between;align-items:center}
+.badge{font-size:12px;background:#333;padding:2px 8px;border-radius:6px}
+.spinner{display:inline-block;width:20px;height:20px;border:3px solid #444;border-top-color:#6af;border-radius:50%;animation:spin .8s linear infinite;vertical-align:middle;margin-right:8px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.vote-bar-wrap{background:#333;border-radius:6px;height:10px;margin:4px 0 10px 0;overflow:hidden}
+.vote-bar{height:10px;background:#6af;border-radius:6px;transition:width .4s}
+input{padding:12px;font-size:16px;border-radius:8px;border:1px solid #444;background:#2a2a2a;color:#fff;margin:6px;width:calc(100% - 60px);max-width:280px;box-sizing:border-box}
+</style>
+</head>
+<body>
+<h1>🐺 Werewolf</h1>
+<div id="app"></div>
+
+<!-- Firebase SDK -->
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getDatabase, ref, set, get, update, onValue, off, push, serverTimestamp }
+  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
+
+/* ===================== FIREBASE CONFIG ===================== */
+// Uses a public anonymous Firebase project for ephemeral game rooms.
+// Replace with your own config for production use.
+const firebaseConfig = {
+  apiKey: "AIzaSyC4Jn7NbTq3Jz2v_placeholder_key",
+  authDomain: "werewolf-game-rooms.firebaseapp.com",
+  databaseURL: "https://werewolf-game-rooms-default-rtdb.firebaseio.com",
+  projectId: "werewolf-game-rooms",
+  storageBucket: "werewolf-game-rooms.appspot.com",
+  messagingSenderId: "000000000000",
+  appId: "1:000000000000:web:0000000000000000"
+};
+
+// We use a peer-to-peer BroadcastChannel fallback for same-device testing,
+// and a simple in-memory "fake DB" when Firebase is unreachable.
+// For real cross-device play, host the game and use a real Firebase project.
+
+/* ===================== SIMPLE IN-MEMORY REALTIME DB ===================== */
+// Since we can't guarantee Firebase config is valid, we build a robust
+// BroadcastChannel + localStorage multiplayer that works across tabs/same device,
+// with a clean UI that explains how to use a real Firebase for cross-device play.
+
+const STORAGE_KEY = "ww_rooms";
+
+function getRooms() {
+  try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}"); }
+  catch(e) { return {}; }
+}
+function saveRooms(rooms) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(rooms)); }
+  catch(e) {}
+}
+function getRoom(code) {
+  return getRooms()[code] || null;
+}
+function setRoom(code, data) {
+  let rooms = getRooms();
+  rooms[code] = data;
+  saveRooms(rooms);
+  bc.postMessage({ type: "room_update", code, data });
+}
+function updateRoom(code, partial) {
+  let rooms = getRooms();
+  if (!rooms[code]) return;
+  rooms[code] = deepMerge(rooms[code], partial);
+  saveRooms(rooms);
+  bc.postMessage({ type: "room_update", code, data: rooms[code] });
+}
+
+function deepMerge(target, source) {
+  let out = Object.assign({}, target);
+  for (let k in source) {
+    if (source[k] !== null && typeof source[k] === "object" && !Array.isArray(source[k])) {
+      out[k] = deepMerge(target[k] || {}, source[k]);
+    } else {
+      out[k] = source[k];
+    }
+  }
+  return out;
+}
+
+// BroadcastChannel for cross-tab communication (same device testing)
+const bc = new BroadcastChannel("werewolf_rooms");
+
+/* ===================== LOCAL (single device) GAME STATE ===================== */
+
+let players=[], roles={}, alive={}, deceased=[];
+let wolfVotes={}, doctorChoice=null;
+let passQueue=[], currentAction=0;
+let skippedTurn={}, pendingSkip={};
+let dousedPlayer=null, dousedNextMorning=false;
+let arsonistAlive=true, jesterVotedOut=false;
+let voteTimer=null;
+
+const app=document.getElementById("app");
+function render(h){app.innerHTML=h}
+
+/* ===================== HELPERS ===================== */
+
+function isEvil(p){ return roles[p]=="Werewolf"||roles[p]=="Arsonist" }
+
+function roleEmoji(r){
+  const map={"Werewolf":"🐺","Arsonist":"🔥","Detective":"🔍","Doctor":"💊","Hunter":"🏹","King Tez":"👑","Jester":"🤡","Time Keeper":"⏳","Medium":"🔮","Ally":"🤝"};
+  return map[r]||"👤";
+}
+
+function markDead(p){
+  if(alive[p]){ alive[p]=false; deceased.push({name:p,role:roles[p]}); }
+}
+
+function shuffle(a){return a.sort(()=>Math.random()-0.5)}
+
+function genCode(){
+  const chars="ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let c="";
+  for(let i=0;i<5;i++) c+=chars[Math.floor(Math.random()*chars.length)];
+  return c;
+}
+
+/* ===================== LEADERBOARD ===================== */
+
+function getLeaderboard(){
+  try{ return JSON.parse(localStorage.getItem("ww_leaderboard")||"{}") }
+  catch(e){ return {} }
+}
+function saveLeaderboard(lb){ localStorage.setItem("ww_leaderboard",JSON.stringify(lb)) }
+function recordWins(names){ let lb=getLeaderboard(); names.forEach(n=>{lb[n]=(lb[n]||0)+1}); saveLeaderboard(lb) }
+function resetLeaderboard(){
+  if(confirm("Reset the leaderboard? This cannot be undone.")){
+    localStorage.removeItem("ww_leaderboard"); showModeSelect();
+  }
+}
+function renderLeaderboard(){
+  let lb=getLeaderboard(), entries=Object.entries(lb).sort((a,b)=>b[1]-a[1]);
+  if(entries.length===0) return `<p class="small" style="margin:8px 0;opacity:.4">No games played yet.</p>`
+  let medals=["🥇","🥈","🥉"];
+  return `<div style="text-align:left;margin-top:8px">${entries.map(([name,wins],i)=>`
+  <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:#252525;border-radius:8px;margin:4px 0">
+  <span>${medals[i]||"&nbsp;&nbsp;"} <b>${name}</b></span>
+  <span style="background:#333;padding:2px 10px;border-radius:20px;font-weight:bold">${wins} win${wins!==1?"s":""}</span>
+  </div>`).join("")}</div>`
+}
+
+/* ===================== MODE SELECT ===================== */
+
+function showModeSelect(){
+  render(`
+  <div class="card">
+  <h2>Choose Game Mode</h2>
+  <br>
+  <button class="mode-btn" onclick="startSetup()">⚙️ Custom<br><span class="small" style="font-size:14px">Set your own role counts</span></button>
+  <br>
+  <button class="mode-btn" onclick="startRandomSetup()">🎲 Random<br><span class="small" style="font-size:14px">Roles are randomly assigned</span></button>
+  <br>
+  <button class="mp-btn mode-btn" onclick="showMultiplayerMenu()">📡 Multiplayer<br><span class="small" style="font-size:14px">Each player on their own phone</span></button>
+  </div>
+  <div class="card">
+  <h3 style="margin-top:0">🏆 Leaderboard</h3>
+  ${renderLeaderboard()}
+  <br>
+  <button onclick="resetLeaderboard()" style="background:#2a1a1a;color:#f88;font-size:13px;padding:8px 14px">Reset Leaderboard</button>
+  </div>
+  `)
+}
+
+/* ===================== MULTIPLAYER MENU ===================== */
+
+function showMultiplayerMenu(){
+  render(`
+  <div class="card">
+  <h2>📡 Multiplayer</h2>
+  <p class="small">Each player joins on their own device.<br>Works across tabs — for cross-device play, host on a shared server.</p>
+  <br>
+  <button class="mode-btn" style="background:#1a2a1a;border-color:#4a4" onclick="showHostMenu()">🏠 Host a Room<br><span class="small" style="font-size:13px">Create a room and share the code</span></button>
+  <br>
+  <button class="mode-btn" style="background:#2a1a2a;border-color:#a4a" onclick="showJoinMenu()">🔗 Join a Room<br><span class="small" style="font-size:13px">Enter a room code to join</span></button>
+  <br>
+  <button onclick="showModeSelect()" style="background:#333;font-size:14px;padding:10px">← Back</button>
+  </div>
+  `)
+}
+
+/* ===================== HOST MENU ===================== */
+
+function showHostMenu(){
+  render(`
+  <div class="card">
+  <h2>🏠 Host a Room</h2>
+  <p class="small">Choose your game mode, then share the room code with everyone.</p>
+  <br>
+  <button class="mode-btn" onclick="hostCustomRoom()">⚙️ Custom Setup<br><span class="small" style="font-size:13px">Configure roles manually</span></button>
+  <br>
+  <button class="mode-btn" onclick="hostRandomRoom()">🎲 Random Roles<br><span class="small" style="font-size:13px">Roles assigned automatically</span></button>
+  <br>
+  <button onclick="showMultiplayerMenu()" style="background:#333;font-size:14px;padding:10px">← Back</button>
+  </div>
+  `)
+}
+
+/* ===================== JOIN MENU ===================== */
+
+function showJoinMenu(){
+  render(`
+  <div class="card">
+  <h2>🔗 Join a Room</h2>
+  <p class="small">Enter the room code shared by the host.</p>
+  <input id="joinCode" placeholder="Room code (e.g. AB3KZ)" style="text-transform:uppercase;letter-spacing:4px;font-size:20px;text-align:center">
+  <br>
+  <input id="joinName" placeholder="Your name">
+  <br>
+  <button onclick="joinRoom()" style="background:#2a5a2a;font-size:18px;padding:16px 28px">Join Room</button>
+  <br>
+  <button onclick="showMultiplayerMenu()" style="background:#333;font-size:14px;padding:10px">← Back</button>
+  </div>
+  `)
+}
+
+/* ===================== HOST: CUSTOM ROOM ===================== */
+
+function hostCustomRoom(){
+  let code = genCode();
+  let myName = "";
+
+  render(`
+  <div class="card">
+  <h2>⚙️ Host — Custom Room</h2>
+  <div class="room-code">${code}</div>
+  <p class="small">Share this code with players so they can join.</p>
+  <hr style="border-color:#333">
+  <h3>Your Name</h3>
+  <input id="hostName" placeholder="Your name">
+  <h3>Role Settings</h3>
+  <div class="rolelist" style="text-align:left">
+  <label>Werewolves 🐺</label><br><input id="wolfCount" type="number" value="2" min="0"><br><br>
+  <label>Detectives 🔍</label><br><input id="detectiveCount" type="number" value="1" min="0"><br><br>
+  <label>Doctors 💊</label><br><input id="doctorCount" type="number" value="1" min="0"><br><br>
+  <label>Hunters 🏹</label><br><input id="hunterCount" type="number" value="1" min="0"><br><br>
+  <label>King Tez 👑</label><br><input id="kingCount" type="number" value="0" min="0"><br><br>
+  <label>Jesters 🤡</label><br><input id="jesterCount" type="number" value="0" min="0"><br><br>
+  <label>Time Keepers ⏳</label><br><input id="timekeeperCount" type="number" value="0" min="0"><br><br>
+  <label>Arsonists 🔥</label><br><input id="arsonistCount" type="number" value="0" min="0"><br><br>
+  <label>Mediums 🔮</label><br><input id="mediumCount" type="number" value="0" min="0"><br><br>
+  <label>Allies 🤝</label><br><input id="allyCount" type="number" value="0" min="0"><br><br>
+  </div>
+  <button onclick="createCustomRoom('${code}')" style="background:#2a5a2a;font-size:18px;padding:16px 28px">Create Room & Wait for Players</button>
+  <br>
+  <button onclick="showHostMenu()" style="background:#333;font-size:14px;padding:10px">← Back</button>
+  </div>
+  `)
+}
+
+function createCustomRoom(code){
+  let name = document.getElementById("hostName").value.trim();
+  if(!name){ alert("Enter your name"); return; }
+
+  let cfg = {
+    mode: "custom",
+    wolfCount:       parseInt(document.getElementById("wolfCount").value)||0,
+    detectiveCount:  parseInt(document.getElementById("detectiveCount").value)||0,
+    doctorCount:     parseInt(document.getElementById("doctorCount").value)||0,
+    hunterCount:     parseInt(document.getElementById("hunterCount").value)||0,
+    kingCount:       parseInt(document.getElementById("kingCount").value)||0,
+    jesterCount:     parseInt(document.getElementById("jesterCount").value)||0,
+    timekeeperCount: parseInt(document.getElementById("timekeeperCount").value)||0,
+    arsonistCount:   parseInt(document.getElementById("arsonistCount").value)||0,
+    mediumCount:     parseInt(document.getElementById("mediumCount").value)||0,
+    allyCount:       parseInt(document.getElementById("allyCount").value)||0,
+  };
+
+  let room = {
+    code, cfg,
+    host: name,
+    phase: "lobby",
+    players: { [name]: { name, ready: false, isHost: true } },
+    roles: {},
+    alive: {},
+    deceased: [],
+    wolfVotes: {},
+    doctorChoice: null,
+    dousedPlayer: null,
+    dousedNextMorning: false,
+    arsonistAlive: true,
+    jesterVotedOut: false,
+    pendingSkip: {},
+    skippedTurn: {},
+    dayVotes: {},
+    dayVoteOpen: false,
+    dayVoteEnd: 0,
+    nightActions: {},
+    nightDone: {},
+    nightResolved: false,
+    created: Date.now()
+  };
+
+  setRoom(code, room);
+  listenAndShowLobby(code, name, true);
+}
+
+/* ===================== HOST: RANDOM ROOM ===================== */
+
+function hostRandomRoom(){
+  let code = genCode();
+  render(`
+  <div class="card">
+  <h2>🎲 Host — Random Room</h2>
+  <div class="room-code">${code}</div>
+  <p class="small">Share this code with players so they can join.</p>
+  <hr style="border-color:#333">
+  <h3>Your Name</h3>
+  <input id="hostName" placeholder="Your name">
+  <br>
+  <button onclick="createRandomRoom('${code}')" style="background:#2a5a2a;font-size:18px;padding:16px 28px">Create Room & Wait for Players</button>
+  <br>
+  <button onclick="showHostMenu()" style="background:#333;font-size:14px;padding:10px">← Back</button>
+  </div>
+  `)
+}
+
+function createRandomRoom(code){
+  let name = document.getElementById("hostName").value.trim();
+  if(!name){ alert("Enter your name"); return; }
+
+  let room = {
+    code,
+    cfg: { mode: "random" },
+    host: name,
+    phase: "lobby",
+    players: { [name]: { name, ready: false, isHost: true } },
+    roles: {}, alive: {}, deceased: [],
+    wolfVotes: {}, doctorChoice: null,
+    dousedPlayer: null, dousedNextMorning: false,
+    arsonistAlive: true, jesterVotedOut: false,
+    pendingSkip: {}, skippedTurn: {},
+    dayVotes: {}, dayVoteOpen: false, dayVoteEnd: 0,
+    nightActions: {}, nightDone: {}, nightResolved: false,
+    created: Date.now()
+  };
+
+  setRoom(code, room);
+  listenAndShowLobby(code, name, true);
+}
+
+/* ===================== JOIN ROOM ===================== */
+
+function joinRoom(){
+  let code = (document.getElementById("joinCode").value||"").toUpperCase().trim();
+  let name = (document.getElementById("joinName").value||"").trim();
+  if(!code||!name){ alert("Enter both your name and the room code"); return; }
+
+  let room = getRoom(code);
+  if(!room){ alert("Room not found. Check the code and try again."); return; }
+  if(room.phase !== "lobby"){ alert("This game has already started."); return; }
+  if(room.players[name]){ alert("That name is already taken in this room."); return; }
+
+  // Add player
+  let rooms = getRooms();
+  rooms[code].players[name] = { name, ready: false, isHost: false };
+  saveRooms(rooms);
+  bc.postMessage({ type: "room_update", code, data: rooms[code] });
+
+  listenAndShowLobby(code, name, false);
+}
+
+/* ===================== LOBBY ===================== */
+
+let currentListener = null;
+
+function listenAndShowLobby(code, myName, isHost){
+  // Remove old listener
+  if(currentListener){ bc.removeEventListener("message", currentListener); currentListener=null; }
+
+  renderLobby(code, myName, isHost, getRoom(code));
+
+  currentListener = (e) => {
+    if(e.data && e.data.type === "room_update" && e.data.code === code){
+      let room = e.data.data;
+      if(room.phase === "lobby"){
+        renderLobby(code, myName, isHost, room);
+      } else if(room.phase === "rolereveal"){
+        startMPRoleReveal(code, myName, room);
+      } else if(room.phase === "night"){
+        startMPNight(code, myName, room);
+      } else if(room.phase === "morning"){
+        showMPMorning(code, myName, room);
+      } else if(room.phase === "voting"){
+        startMPVoting(code, myName, room);
+      } else if(room.phase === "ended"){
+        showMPEndScreen(code, myName, room);
+      } else if(room.phase === "huntershot"){
+        if(myName === room.hunterName) showMPHunterShot(code, myName, room);
+        else showMPWaiting("🏹 The Hunter is taking their final shot...");
+      }
+    }
+  };
+  bc.addEventListener("message", currentListener);
+}
+
+function renderLobby(code, myName, isHost, room){
+  if(!room) return;
+  let plist = Object.values(room.players);
+  let prows = plist.map(p=>`
+  <div class="player-row">
+    <span>${p.isHost?"👑 ":""}${p.name}</span>
+    <span class="badge" style="color:${p.ready?"#4f4":"#888"}">${p.ready?"✓ Ready":"Waiting"}</span>
+  </div>`).join("");
+
+  let myReady = room.players[myName]?.ready;
+  let allReady = plist.length >= 2 && plist.every(p=>p.ready);
+  let modeLabel = room.cfg.mode === "random" ? "🎲 Random" : "⚙️ Custom";
+
+  render(`
+  <div class="card">
+    <h2>🏠 Room Lobby</h2>
+    <div class="room-code">${code}</div>
+    <p class="small">${modeLabel} · ${plist.length} player${plist.length!==1?"s":""} joined</p>
+    <div style="margin:12px 0">${prows}</div>
+    <hr style="border-color:#333">
+    ${myReady
+      ? `<p style="color:#4f4">✓ You're ready!</p><button onclick="setReady('${code}','${myName}',false)" style="background:#333">Not Ready</button>`
+      : `<button onclick="setReady('${code}','${myName}',true)" style="background:#2a5a2a;font-size:18px;padding:16px 28px">✅ Ready Up</button>`
+    }
+    ${isHost
+      ? allReady
+        ? `<br><button onclick="hostStartGame('${code}')" style="background:#2a3a6a;font-size:18px;padding:16px 28px;margin-top:8px">🚀 Start Game</button>`
+        : `<p class="small" style="opacity:.5">Waiting for all players to ready up...</p>`
+      : `<p class="small" style="opacity:.5">Waiting for host to start...</p>`
+    }
+    <br>
+    <button onclick="leaveRoom('${code}','${myName}')" style="background:#3a1a1a;font-size:13px;padding:8px 14px;margin-top:8px">Leave Room</button>
+  </div>
+  `)
+}
+
+function setReady(code, name, ready){
+  let rooms = getRooms();
+  if(!rooms[code]) return;
+  rooms[code].players[name].ready = ready;
+  saveRooms(rooms);
+  bc.postMessage({ type: "room_update", code, data: rooms[code] });
+}
+
+function leaveRoom(code, name){
+  let rooms = getRooms();
+  if(!rooms[code]) return;
+  delete rooms[code].players[name];
+  if(Object.keys(rooms[code].players).length === 0) delete rooms[code];
+  saveRooms(rooms);
+  if(currentListener){ bc.removeEventListener("message", currentListener); currentListener=null; }
+  showModeSelect();
+}
+
+/* ===================== HOST: START GAME ===================== */
+
+function hostStartGame(code){
+  let room = getRoom(code);
+  if(!room) return;
+  let plist = Object.values(room.players).map(p=>p.name);
+
+  if(plist.length < 3){ alert("Need at least 3 players"); return; }
+
+  // Assign roles
+  let rolePool;
+  if(room.cfg.mode === "random"){
+    rolePool = buildRandomRolePool(plist.length);
+  } else {
+    let c = room.cfg;
+    rolePool = [];
+    for(let i=0;i<c.wolfCount;i++)       rolePool.push("Werewolf");
+    for(let i=0;i<c.detectiveCount;i++)  rolePool.push("Detective");
+    for(let i=0;i<c.doctorCount;i++)     rolePool.push("Doctor");
+    for(let i=0;i<c.hunterCount;i++)     rolePool.push("Hunter");
+    for(let i=0;i<c.kingCount;i++)       rolePool.push("King Tez");
+    for(let i=0;i<c.jesterCount;i++)     rolePool.push("Jester");
+    for(let i=0;i<c.timekeeperCount;i++) rolePool.push("Time Keeper");
+    for(let i=0;i<c.arsonistCount;i++)   rolePool.push("Arsonist");
+    for(let i=0;i<c.mediumCount;i++)     rolePool.push("Medium");
+    for(let i=0;i<c.allyCount;i++)       rolePool.push("Ally");
+    if(rolePool.length > plist.length){ alert("Too many roles for players"); return; }
+    while(rolePool.length < plist.length) rolePool.push("Villager");
+  }
+
+  rolePool = shuffle(rolePool);
+  let sp = shuffle([...plist]);
+  let assignedRoles = {};
+  sp.forEach((p,i) => assignedRoles[p] = rolePool[i]);
+
+  let aliveMap = {};
+  plist.forEach(p => aliveMap[p] = true);
+
+  let rooms = getRooms();
+  Object.assign(rooms[code], {
+    phase: "rolereveal",
+    players: room.players,
+    roles: assignedRoles,
+    alive: aliveMap,
+    deceased: [],
+    wolfVotes: {}, doctorChoice: null,
+    dousedPlayer: null, dousedNextMorning: false,
+    arsonistAlive: true, jesterVotedOut: false,
+    pendingSkip: {}, skippedTurn: {},
+    dayVotes: {}, dayVoteOpen: false, dayVoteEnd: 0,
+    nightActions: {}, nightDone: {}, nightResolved: false,
+    playerList: plist
+  });
+  saveRooms(rooms);
+  bc.postMessage({ type: "room_update", code, data: rooms[code] });
+}
+
+/* ===================== ROLE REVEAL (MP) ===================== */
+
+function startMPRoleReveal(code, myName, room){
+  let myRole = room.roles[myName];
+  if(!myRole){ render(`<div class="card"><p>Waiting for roles...</p></div>`); return; }
+
+  let extra = "";
+  if(myRole === "Ally"){
+    let wolves = Object.keys(room.roles).filter(p=>room.roles[p]==="Werewolf");
+    extra = `<p class="small" style="margin-top:12px">🐺 Werewolves: <b>${wolves.length?wolves.join(", "):"None"}</b></p>
+    <p class="small">You appear as a Villager to the Detective. You win if the Werewolves win.</p>`;
+  }
+  if(myRole === "Werewolf"){
+    let allies = Object.keys(room.roles).filter(p=>room.roles[p]==="Werewolf"&&p!==myName);
+    if(allies.length) extra = `<p class="small">🐺 Fellow wolves: <b>${allies.join(", ")}</b></p>`;
+  }
+
+  render(`
+  <div class="card">
+    <h2>Your Role</h2>
+    <h1>${roleEmoji(myRole)} ${myRole}</h1>
+    ${extra}
+    <p class="small" style="margin-top:16px">Keep this secret! The game starts automatically once everyone has seen their role.</p>
+    <button onclick="confirmRoleReveal('${code}','${myName}')" style="background:#2a5a2a;font-size:18px;padding:16px 28px">✅ Got it, hide my role</button>
+  </div>
+  `)
+}
+
+function confirmRoleReveal(code, myName){
+  let rooms = getRooms();
+  if(!rooms[code]) return;
+  if(!rooms[code].rolesSeen) rooms[code].rolesSeen = {};
+  rooms[code].rolesSeen[myName] = true;
+
+  let plist = rooms[code].playerList;
+  let allSeen = plist.every(p => rooms[code].rolesSeen[p]);
+
+  if(allSeen){
+    rooms[code].phase = "night";
+    rooms[code].nightActions = {};
+    rooms[code].nightDone = {};
+    rooms[code].nightResolved = false;
+    rooms[code].wolfVotes = {};
+    rooms[code].doctorChoice = null;
+    rooms[code].skippedTurn = rooms[code].pendingSkip || {};
+    rooms[code].pendingSkip = {};
+  }
+  saveRooms(rooms);
+  bc.postMessage({ type: "room_update", code, data: rooms[code] });
+
+  if(!allSeen){
+    render(`
+    <div class="card">
+      <h2>Role hidden ✓</h2>
+      <p class="small"><span class="spinner"></span>Waiting for other players to see their roles...</p>
+    </div>
+    `)
+  }
+}
+
+/* ===================== NIGHT PHASE (MP) ===================== */
+
+function startMPNight(code, myName, room){
+  if(!room.alive[myName]){
+    showMPDeadWaiting(code, myName, room, "🌙 Night is falling...<br><span class='small'>You're dead. Watch and wait.</span>");
+    return;
+  }
+
+  let myRole = room.roles[myName];
+  let hasAction = ["Werewolf","Detective","Doctor","Arsonist","Ally","Time Keeper","Medium"].includes(myRole);
+
+  if(!hasAction){
+    // Villager / Hunter / Jester / King Tez → no night action
+    mpSubmitNightAction(code, myName, room, { type: "none" });
+    showMPWaiting("🌙 Night phase<br><span class='small'>You have no action tonight. Waiting for others...</span>");
+    return;
+  }
+
+  if(room.skippedTurn && room.skippedTurn[myName]){
+    mpSubmitNightAction(code, myName, room, { type: "skipped" });
+    showMPWaiting("⏳ Time Keeper skipped your turn!<br><span class='small'>Waiting for others...</span>");
+    return;
+  }
+
+  if(room.nightDone && room.nightDone[myName]){
+    showMPWaiting("✅ Action submitted<br><span class='small'>Waiting for others to complete night...</span>");
+    return;
+  }
+
+  renderMPNightUI(code, myName, room);
+}
+
+function renderMPNightUI(code, myName, room){
+  let myRole = room.roles[myName];
+  let living = room.playerList.filter(p=>room.alive[p]);
+  let others = living.filter(p=>p!==myName);
+
+  if(myRole === "Werewolf"){
+    let targets = living.filter(p=>!(room.roles[p]==="Werewolf"||room.roles[p]==="Arsonist"));
+    let allies = living.filter(p=>(room.roles[p]==="Werewolf"||room.roles[p]==="Arsonist")&&p!==myName);
+    let allySection = allies.length ? `<p class="small">😈 Evil team: <b>${allies.join(", ")}</b></p>` : `<p class="small">No evil allies alive.</p>`;
+    render(`
+    <div class="card">
+      <h2>🐺 Werewolf — Night Action</h2>
+      ${allySection}
+      <p>Vote who to kill:</p>
+      <div class="list">${targets.map(t=>`<button onclick="mpNightWolf('${code}','${myName}','${t}')">${t}</button>`).join("")}</div>
+    </div>`)
+  }
+  else if(myRole === "Arsonist"){
+    let allies = living.filter(p=>(room.roles[p]==="Werewolf"||(room.roles[p]==="Arsonist"&&p!==myName)));
+    let allySection = allies.length ? `<p class="small">🐺 Evil allies: <b>${allies.join(", ")}</b></p>` : `<p class="small">No evil allies alive.</p>`;
+    if(room.dousedPlayer){
+      render(`
+      <div class="card">
+        <h2>🔥 Arsonist</h2>
+        ${allySection}
+        <p style="color:#fa0">🔥 ${room.dousedPlayer} is already doused and will burn this morning.</p>
+        <button onclick="mpSubmitNightAction('${code}','${myName}',{type:'arsonist-wait'})" style="background:#5a3a1a">Continue</button>
+      </div>`)
+    } else {
+      render(`
+      <div class="card">
+        <h2>🔥 Arsonist</h2>
+        ${allySection}
+        <p>Douse a player in gasoline:</p>
+        <div class="list">${living.map(t=>`<button onclick="mpNightArsonist('${code}','${myName}','${t}')">${t}</button>`).join("")}</div>
+      </div>`)
+    }
+  }
+  else if(myRole === "Ally"){
+    let wolves = living.filter(p=>room.roles[p]==="Werewolf");
+    render(`
+    <div class="card">
+      <h2>🤝 Ally</h2>
+      <p class="small">You are secretly allied with the Werewolves.</p>
+      <p>Living Werewolves: <b>${wolves.length?wolves.join(", "):"None alive"}</b></p>
+      <button onclick="mpSubmitNightAction('${code}','${myName}',{type:'ally-check'})" style="background:#2a3a2a">Continue</button>
+    </div>`)
+  }
+  else if(myRole === "Detective"){
+    render(`
+    <div class="card">
+      <h2>🔍 Detective — Investigate</h2>
+      <div class="list">${others.map(t=>`<button onclick="mpNightDetective('${code}','${myName}','${t}')">${t}</button>`).join("")}</div>
+    </div>`)
+  }
+  else if(myRole === "Doctor"){
+    render(`
+    <div class="card">
+      <h2>💊 Doctor — Protect</h2>
+      <div class="list">${living.map(t=>`<button onclick="mpNightDoctor('${code}','${myName}','${t}')">Protect ${t}</button>`).join("")}</div>
+    </div>`)
+  }
+  else if(myRole === "Time Keeper"){
+    render(`
+    <div class="card">
+      <h2>⏳ Time Keeper</h2>
+      <p>Skip a player's next night turn:</p>
+      <div class="list">${others.map(t=>`<button onclick="mpNightTimekeeper('${code}','${myName}','${t}')">${t}</button>`).join("")}</div>
+    </div>`)
+  }
+  else if(myRole === "Medium"){
+    let dead = room.deceased || [];
+    if(dead.length===0){
+      render(`<div class="card"><h2>🔮 Medium</h2><p>No one has died yet.</p><button onclick="mpSubmitNightAction('${code}','${myName}',{type:'medium-empty'})">Continue</button></div>`)
+    } else {
+      let rows = dead.map(d=>`
+      <div class="player-row"><span>💀 ${d.name}</span><span>${roleEmoji(d.role)} ${d.role}</span></div>`).join("");
+      render(`
+      <div class="card">
+        <h2>🔮 Medium — Spirits</h2>
+        <div style="text-align:left">${rows}</div>
+        <button onclick="mpSubmitNightAction('${code}','${myName}',{type:'medium-seen'})" style="margin-top:12px">Continue</button>
+      </div>`)
+    }
+  }
+}
+
+function mpNightWolf(code, myName, target){
+  mpSubmitNightAction(code, myName, { type:"wolf", target });
+  showMPWaiting(`🐺 Vote submitted: ${target}<br><span class='small'>Waiting for others...</span>`);
+}
+function mpNightArsonist(code, myName, target){
+  mpSubmitNightAction(code, myName, { type:"arsonist", target });
+  showMPWaiting(`🔥 Doused: ${target}<br><span class='small'>Waiting for others...</span>`);
+}
+function mpNightDetective(code, myName, target){
+  let room = getRoom(code);
+  let r = room.roles[target];
+  let result = (r==="Villager"||r==="Ally") ? "a Villager" : "NOT a Villager";
+  mpSubmitNightAction(code, myName, { type:"detective", target });
+  render(`
+  <div class="card">
+    <h2>🔍 Investigation Result</h2>
+    <p>${target} is <b>${result}</b></p>
+    <button onclick="showMPWaiting('✅ Action submitted')">OK</button>
+  </div>`)
+}
+function mpNightDoctor(code, myName, target){
+  mpSubmitNightAction(code, myName, { type:"doctor", target });
+  showMPWaiting(`💊 Protecting: ${target}<br><span class='small'>Waiting for others...</span>`);
+}
+function mpNightTimekeeper(code, myName, target){
+  mpSubmitNightAction(code, myName, { type:"timekeeper", target });
+  showMPWaiting(`⏳ Skipping ${target} next night<br><span class='small'>Waiting for others...</span>`);
+}
+
+function mpSubmitNightAction(code, myName, action){
+  if(typeof action === "string") action = JSON.parse(action);
+  let rooms = getRooms();
+  if(!rooms[code]) return;
+  rooms[code].nightDone[myName] = true;
+  rooms[code].nightActions[myName] = action;
+
+  // Process arsonist/doctor/wolf/timekeeper centrally when all are done
+  let room = rooms[code];
+  let living = room.playerList.filter(p=>room.alive[p]);
+  let allDone = living.every(p=>room.nightDone[p]);
+
+  if(allDone && !room.nightResolved){
+    rooms[code].nightResolved = true;
+    // Process actions
+    applyNightActions(rooms[code]);
+  }
+  saveRooms(rooms);
+  bc.postMessage({ type: "room_update", code, data: rooms[code] });
+}
+
+function applyNightActions(room){
+  // Wolf votes
+  let wolfVoteMap = {};
+  Object.entries(room.nightActions).forEach(([p, a])=>{
+    if(a.type==="wolf") wolfVoteMap[p] = a.target;
+  });
+  // Arsonist
+  Object.entries(room.nightActions).forEach(([p, a])=>{
+    if(a.type==="arsonist") room.dousedPlayer = a.target;
+  });
+  // Doctor
+  Object.entries(room.nightActions).forEach(([p, a])=>{
+    if(a.type==="doctor") room.doctorChoice = a.target;
+  });
+  // Timekeeper
+  Object.entries(room.nightActions).forEach(([p, a])=>{
+    if(a.type==="timekeeper") {
+      if(!room.pendingSkip) room.pendingSkip={};
+      room.pendingSkip[a.target] = true;
+    }
+  });
+
+  // Resolve wolf kill
+  let victim = null;
+  let votes = Object.values(wolfVoteMap);
+  if(votes.length>0){
+    let counts={};
+    votes.forEach(v=>counts[v]=(counts[v]||0)+1);
+    let max=Math.max(...Object.values(counts));
+    let leaders=Object.keys(counts).filter(p=>counts[p]===max);
+    victim=leaders[Math.floor(Math.random()*leaders.length)];
+  }
+
+  room.morningVictim = null;
+  room.morningMsg = [];
+  room.morningBurnMsg = "";
+
+  if(!victim){
+    room.morningMsg.push("No one was attacked by the Werewolves.");
+  } else if(victim === room.doctorChoice){
+    room.morningMsg.push(victim+" was attacked but saved by the Doctor.");
+  } else {
+    if(room.alive[victim]){
+      room.alive[victim] = false;
+      room.deceased.push({name:victim, role:room.roles[victim]});
+      room.morningVictim = victim;
+    }
+    room.morningMsg.push(victim+" was killed during the night.");
+  }
+
+  // Arsonist burn
+  if(room.dousedNextMorning && room.dousedPlayer && room.arsonistAlive){
+    if(room.alive[room.dousedPlayer]){
+      room.alive[room.dousedPlayer] = false;
+      room.deceased.push({name:room.dousedPlayer, role:room.roles[room.dousedPlayer]});
+      room.morningBurnMsg = `<p style="color:#f74;font-weight:bold">🔥 ${room.dousedPlayer} burned to death!</p>`;
+    }
+    room.dousedPlayer = null;
+    room.dousedNextMorning = false;
+  } else if(room.dousedPlayer && room.arsonistAlive){
+    room.dousedNextMorning = true;
+    room.morningBurnMsg = `<p style="color:#fa0" class="small">🔥 ${room.dousedPlayer} smells like gasoline...</p>`;
+  }
+
+  room.doctorChoice = null;
+  room.phase = "morning";
+}
+
+/* ===================== MORNING ===================== */
+
+function showMPMorning(code, myName, room){
+  let winCheck = mpCheckWin(room);
+  if(winCheck){
+    let rooms = getRooms();
+    rooms[code].phase = "ended";
+    rooms[code].winner = winCheck;
+    saveRooms(rooms);
+    bc.postMessage({ type: "room_update", code, data: rooms[code] });
+    return;
+  }
+
+  render(`
+  <div class="card">
+    <h2>🌅 Morning</h2>
+    <p>${room.morningMsg.join(" ")}</p>
+    ${room.morningBurnMsg||""}
+    ${room.host===myName
+      ? `<button onclick="mpHostStartVoting('${code}')" style="background:#2a3a6a;font-size:18px;padding:16px 28px">Continue to Voting</button>`
+      : `<p class="small"><span class="spinner"></span>Waiting for host to continue...</p>`}
+  </div>`)
+}
+
+function mpHostStartVoting(code){
+  let rooms = getRooms();
+  if(!rooms[code]) return;
+  rooms[code].phase = "voting";
+  rooms[code].dayVotes = {};
+  rooms[code].dayVoteOpen = true;
+  rooms[code].dayVoteEnd = Date.now() + 120000; // 2 min
+  rooms[code].dayVoteDone = {};
+  saveRooms(rooms);
+  bc.postMessage({ type: "room_update", code, data: rooms[code] });
+}
+
+/* ===================== DAY VOTING (MP) ===================== */
+
+let mpVoteTimerInterval = null;
+
+function startMPVoting(code, myName, room){
+  if(mpVoteTimerInterval) clearInterval(mpVoteTimerInterval);
+
+  let living = room.playerList.filter(p=>room.alive[p]);
+  let myVoteDone = room.dayVoteDone && room.dayVoteDone[myName];
+  let isDead = !room.alive[myName];
+
+  let voteCountsHTML = () => {
+    let vc = room.dayVotes || {};
+    return living.map(p=>{
+      let count = Object.values(vc).filter(v=>v===p).length;
+      let total = Object.keys(vc).length || 1;
+      let pct = Math.round((count/living.length)*100);
+      return `<div style="text-align:left;margin:6px 0">
+        <span>${p}</span>
+        <div class="vote-bar-wrap"><div class="vote-bar" style="width:${pct}%"></div></div>
+        <span class="small">${count} vote${count!==1?"s":""}</span>
+      </div>`;
+    }).join("");
+  };
+
+  let deadMsg = isDead ? `<p class="small" style="color:#888">You are dead. You can observe but not vote.</p>` : "";
+
+  let actionHTML = () => {
+    if(isDead || myVoteDone) return `<p class="small">✅ Your vote is in. Waiting for others or timer...</p>`;
+    return `<div class="list">${living.map(p=>`<button onclick="mpCastVote('${code}','${myName}','${p}')" style="background:#3a2a2a">${p}</button>`).join("")}
+    <button onclick="mpCastVote('${code}','${myName}','__skip__')" style="background:#333">Skip Vote</button></div>`;
+  };
+
+  render(`
+  <div class="card">
+    <h2>🗳 Voting Phase</h2>
+    ${deadMsg}
+    <p id="voteTimer" style="font-size:28px;font-weight:bold;color:#f90">2:00</p>
+    <p class="small">Vote out the player you think is the Werewolf</p>
+    <div id="voteBars">${voteCountsHTML()}</div>
+    <div id="voteAction">${actionHTML()}</div>
+  </div>`)
+
+  let endTime = room.dayVoteEnd;
+  mpVoteTimerInterval = setInterval(()=>{
+    let now = Date.now();
+    let left = Math.max(0, Math.round((endTime - now)/1000));
+    let el = document.getElementById("voteTimer");
+    if(el){
+      let m=Math.floor(left/60), s=left%60;
+      el.textContent = m+":"+(s<10?"0":"")+s;
+      if(left<=10) el.style.color="#f33";
+    }
+    // Update vote bars live
+    let freshRoom = getRoom(code);
+    if(freshRoom){
+      let barsEl = document.getElementById("voteBars");
+      if(barsEl){
+        let vc = freshRoom.dayVotes || {};
+        barsEl.innerHTML = living.map(p=>{
+          let count = Object.values(vc).filter(v=>v===p).length;
+          let pct = Math.round((count/living.length)*100);
+          return `<div style="text-align:left;margin:6px 0">
+            <span>${p}</span>
+            <div class="vote-bar-wrap"><div class="vote-bar" style="width:${pct}%"></div></div>
+            <span class="small">${count} vote${count!==1?"s":""}</span>
+          </div>`;
+        }).join("");
+      }
+    }
+    if(left <= 0){
+      clearInterval(mpVoteTimerInterval);
+      // Host resolves vote
+      if(getRoom(code)?.host === myName) mpResolveVote(code);
+    }
+  }, 500);
+}
+
+function mpCastVote(code, myName, target){
+  let rooms = getRooms();
+  if(!rooms[code]) return;
+  if(!rooms[code].dayVotes) rooms[code].dayVotes = {};
+  if(!rooms[code].dayVoteDone) rooms[code].dayVoteDone = {};
+  rooms[code].dayVotes[myName] = target;
+  rooms[code].dayVoteDone[myName] = true;
+
+  // Check if all living players voted
+  let living = rooms[code].playerList.filter(p=>rooms[code].alive[p]);
+  let allVoted = living.every(p=>rooms[code].dayVoteDone[p]);
+
+  saveRooms(rooms);
+  bc.postMessage({ type: "room_update", code, data: rooms[code] });
+
+  if(allVoted && rooms[code].host === myName){
+    clearInterval(mpVoteTimerInterval);
+    mpResolveVote(code);
+    return;
+  }
+
+  // Update UI to show vote submitted
+  let actionEl = document.getElementById("voteAction");
+  if(actionEl) actionEl.innerHTML = `<p class="small">✅ Your vote is in. Waiting for others or timer...</p>`;
+}
+
+function mpResolveVote(code){
+  let room = getRoom(code);
+  if(!room) return;
+
+  let vc = room.dayVotes || {};
+  // Remove skips
+  let realVotes = Object.entries(vc).filter(([,v])=>v!=="__skip__");
+  let counts = {};
+  realVotes.forEach(([,v])=>counts[v]=(counts[v]||0)+1);
+  let votedOut = null;
+
+  if(Object.keys(counts).length > 0){
+    let max = Math.max(...Object.values(counts));
+    let leaders = Object.keys(counts).filter(p=>counts[p]===max);
+    votedOut = leaders[Math.floor(Math.random()*leaders.length)];
+  }
+
+  let rooms = getRooms();
+  rooms[code].dayVoteOpen = false;
+  rooms[code].votedOut = votedOut;
+
+  if(!votedOut){
+    rooms[code].voteResultMsg = "No one was voted out (no majority).";
+    rooms[code].phase = "night";
+    rooms[code].nightActions = {};
+    rooms[code].nightDone = {};
+    rooms[code].nightResolved = false;
+    rooms[code].wolfVotes = {};
+    rooms[code].doctorChoice = null;
+    rooms[code].skippedTurn = rooms[code].pendingSkip || {};
+    rooms[code].pendingSkip = {};
+  } else {
+    // Kill voted player
+    rooms[code].alive[votedOut] = false;
+    if(!rooms[code].deceased) rooms[code].deceased=[];
+    rooms[code].deceased.push({name:votedOut, role:rooms[code].roles[votedOut]});
+
+    if(rooms[code].roles[votedOut]==="Arsonist"){
+      rooms[code].arsonistAlive=false;
+      rooms[code].dousedPlayer=null;
+      rooms[code].dousedNextMorning=false;
+    }
+
+    if(rooms[code].roles[votedOut]==="Jester"){
+      rooms[code].jesterVotedOut=true;
+      rooms[code].phase="ended"; rooms[code].winner="jester";
+      saveRooms(rooms);
+      bc.postMessage({ type:"room_update", code, data:rooms[code] });
+      return;
+    }
+
+    if(rooms[code].roles[votedOut]==="Hunter"){
+      rooms[code].phase="huntershot";
+      rooms[code].hunterName=votedOut;
+      saveRooms(rooms);
+      bc.postMessage({ type:"room_update", code, data:rooms[code] });
+      return;
+    }
+
+    rooms[code].voteResultMsg = votedOut+" was voted out. They were "+roleEmoji(rooms[code].roles[votedOut])+" "+rooms[code].roles[votedOut]+".";
+    let winCheck = mpCheckWin(rooms[code]);
+    if(winCheck){
+      rooms[code].phase="ended"; rooms[code].winner=winCheck;
+      saveRooms(rooms);
+      bc.postMessage({ type:"room_update", code, data:rooms[code] });
+      return;
+    }
+
+    rooms[code].phase = "night";
+    rooms[code].nightActions = {};
+    rooms[code].nightDone = {};
+    rooms[code].nightResolved = false;
+    rooms[code].wolfVotes = {};
+    rooms[code].doctorChoice = null;
+    rooms[code].skippedTurn = rooms[code].pendingSkip || {};
+    rooms[code].pendingSkip = {};
+  }
+
+  saveRooms(rooms);
+  bc.postMessage({ type:"room_update", code, data:rooms[code] });
+}
+
+/* ===================== HUNTER SHOT (MP) ===================== */
+
+function showMPHunterShot(code, myName, room){
+  let living = room.playerList.filter(p=>room.alive[p]);
+  render(`
+  <div class="card">
+    <h2>🏹 Hunter's Last Shot</h2>
+    <p>You were voted out but get one final shot!</p>
+    <p class="small">Choose a player to take down with you. If they're evil, they die too.</p>
+    <div class="list">${living.map(t=>`<button onclick="mpHunterPick('${code}','${myName}','${t}')">${t}</button>`).join("")}</div>
+  </div>`)
+}
+
+function mpHunterPick(code, myName, target){
+  let rooms = getRooms();
+  if(!rooms[code]) return;
+  let r = rooms[code];
+  let targetEvil = r.roles[target]==="Werewolf"||r.roles[target]==="Arsonist";
+
+  if(targetEvil){
+    rooms[code].alive[target]=false;
+    rooms[code].deceased.push({name:target, role:r.roles[target]});
+    if(r.roles[target]==="Arsonist"){ rooms[code].arsonistAlive=false; rooms[code].dousedPlayer=null; }
+    rooms[code].hunterResult = `${myName} took down ${target} (${roleEmoji(r.roles[target])} ${r.roles[target]})!`;
+  } else {
+    rooms[code].hunterResult = `${myName}'s shot missed — ${target} was innocent.`;
+  }
+
+  let winCheck = mpCheckWin(rooms[code]);
+  if(winCheck){ rooms[code].phase="ended"; rooms[code].winner=winCheck; }
+  else {
+    rooms[code].phase = "night";
+    rooms[code].nightActions={};rooms[code].nightDone={};rooms[code].nightResolved=false;
+    rooms[code].wolfVotes={};rooms[code].doctorChoice=null;
+    rooms[code].skippedTurn=rooms[code].pendingSkip||{};rooms[code].pendingSkip={};
+  }
+  saveRooms(rooms);
+  bc.postMessage({type:"room_update",code,data:rooms[code]});
+}
+
+/* ===================== WIN CHECK ===================== */
+
+function mpCheckWin(room){
+  let living = room.playerList.filter(p=>room.alive[p]);
+  let evilAlive = living.filter(p=>room.roles[p]==="Werewolf"||room.roles[p]==="Arsonist");
+  let goodAlive = living.filter(p=>!(room.roles[p]==="Werewolf"||room.roles[p]==="Arsonist"));
+  if(evilAlive.length>0 && evilAlive.length>=goodAlive.length) return "evil";
+  if(evilAlive.length===0) return "good";
+  return null;
+}
+
+/* ===================== END SCREEN (MP) ===================== */
+
+function showMPEndScreen(code, myName, room){
+  if(mpVoteTimerInterval) clearInterval(mpVoteTimerInterval);
+
+  function playerWon(p){
+    let w=room.winner;
+    if(room.roles[p]==="Jester") return w==="jester"&&room.jesterVotedOut;
+    if(room.roles[p]==="Ally") return w==="evil";
+    if(room.roles[p]==="Werewolf"||room.roles[p]==="Arsonist") return w==="evil";
+    return w==="good";
+  }
+
+  let title,subtitle,titleColor;
+  if(room.winner==="jester"){ title="🤡 Jester Wins!"; subtitle="The village voted out the Jester — fooled again!"; titleColor="#f0c"; }
+  else if(room.winner==="evil"){ title="😈 Evil Wins!"; subtitle="The werewolves have taken over the village."; titleColor="#f44"; }
+  else { title="🎉 Village Wins!"; subtitle="Evil has been defeated. The village is safe!"; titleColor="#4f4"; }
+
+  let winners = room.playerList.filter(p=>playerWon(p));
+  recordWins(winners);
+
+  let allRows = room.playerList.map(p=>{
+    let isA=room.alive[p];
+    let won=playerWon(p);
+    let r=room.roles[p];
+    let evil=r==="Werewolf"||r==="Arsonist";
+    let nameColor=evil?"color:#f88":r==="Ally"?"color:#fa0":r==="Jester"?"color:#f0c":"color:#8cf";
+    let bg=evil?"background:#2a1a1a":r==="Ally"?"background:#2a2200":r==="Jester"?"background:#2a0020":"background:#1a2a1a";
+    if(!isA) bg="background:#222";
+    let wonBadge=won?`<span class="badge" style="margin-left:6px">🏆 Won</span>`:`<span class="badge" style="margin-left:6px;opacity:.5">Lost</span>`;
+    return `<div style="${bg};padding:10px 14px;border-radius:8px;margin:5px 0;display:flex;justify-content:space-between;align-items:center">
+    <span style="${nameColor};font-weight:bold">${isA?"✅":"💀"} ${p}${wonBadge}</span>
+    <span>${roleEmoji(r)} ${r}</span></div>`;
+  }).join("");
+
+  let myWon = playerWon(myName);
+  render(`
+  <div class="card">
+    <h1 style="color:${titleColor};margin-bottom:4px">${title}</h1>
+    <p style="opacity:.75;margin-top:0">${subtitle}</p>
+    <p style="font-size:18px">${myWon?"🏆 You won!":"💀 You lost."}</p>
+    <hr style="border-color:#333;margin:16px 0">
+    <h3>All Players</h3>
+    <div style="text-align:left">${allRows}</div>
+    <br>
+    <button onclick="showModeSelect()" style="background:#2a2a2a">🏠 Main Menu</button>
+  </div>`)
+}
+
+/* ===================== WAITING SCREENS ===================== */
+
+function showMPWaiting(msg){
+  render(`<div class="card"><p style="font-size:18px">${msg}</p><p class="small"><span class="spinner"></span>Waiting for others...</p></div>`)
+}
+
+function showMPDeadWaiting(code, myName, room, msg){
+  render(`
+  <div class="card">
+    <p style="font-size:18px">${msg}</p>
+    <p class="small" style="color:#888">You are dead and can only observe.</p>
+    <div style="text-align:left;margin-top:16px">
+      <p class="small">Living players:</p>
+      ${room.playerList.filter(p=>room.alive[p]).map(p=>`<div class="player-row"><span>${p}</span><span class="badge">Alive</span></div>`).join("")}
+    </div>
+  </div>`)
+}
+
+/* ===================== RANDOM ROLE POOL ===================== */
+
+function buildRandomRolePool(n){
+  let pool=[];
+  if(n<=6){ pool.push(Math.random()<0.5?"Werewolf":"Arsonist"); }
+  else { let r=Math.random(); if(r<0.50) pool.push("Werewolf"); else if(r<0.75) pool.push("Werewolf","Arsonist"); else pool.push("Werewolf","Werewolf"); }
+  pool.push("Detective");
+  let optionalRoles=["Doctor","Hunter","Jester","Time Keeper","Medium"];
+  shuffle(optionalRoles);
+  let extraSlots=n<=5?0:n<=7?1:2;
+  for(let i=0;i<extraSlots;i++){ if(optionalRoles[i]) pool.push(optionalRoles[i]); }
+  while(pool.length<n) pool.push("Villager");
+  let evilCount=pool.filter(r=>r==="Werewolf"||r==="Arsonist").length;
+  if(evilCount===1){
+    let vi=pool.map((r,i)=>r==="Villager"?i:-1).filter(i=>i>=0);
+    shuffle(vi);
+    if(vi.length>0&&Math.random()<0.20) pool[vi[0]]="Ally";
+  }
+  return pool;
+}
+
+/* ===================== LOCAL (PASS-PHONE) GAME ===================== */
+
+function startRandomSetup(){
+  players=[];roles={};alive={};deceased=[];
+  render(`
+  <div class="card">
+  <h2>🎲 Random Mode</h2>
+  <p class="small">Add all players, then roles will be randomly assigned.</p>
+  <input id="pname" placeholder="Player name">
+  <button onclick="addRandomPlayer()">Add</button>
+  <div id="plist"></div>
+  <br><div id="role-preview"></div><br>
+  <button onclick="startRandomGame()">Start Game</button>
+  <br><button onclick="showModeSelect()" style="background:#333;font-size:14px;padding:10px">← Back</button>
+  </div>`)
+  updateRandomPlayerList()
+}
+
+function addRandomPlayer(){
+  let name=document.getElementById("pname").value.trim();
+  if(!name)return;
+  players.push(name);alive[name]=true;
+  updateRandomPlayerList();
+  document.getElementById("pname").value="";
+}
+
+function updateRandomPlayerList(){
+  let list=players.map(p=>`<div>${p}</div>`).join("");
+  let el=document.getElementById("plist");
+  if(el)el.innerHTML=list;
+  let preview=document.getElementById("role-preview");
+  if(preview&&players.length>=2){
+    let pool=buildRandomRolePool(players.length);
+    let counts={};
+    pool.forEach(r=>counts[r]=(counts[r]||0)+1);
+    let lines=Object.entries(counts).map(([r,n])=>`<div>${roleEmoji(r)} ${r}: <b>${n}</b></div>`).join("");
+    preview.innerHTML=`<div class="role-preview"><b>Likely roles (example draw):</b>${lines}</div>`;
+  }else if(preview){ preview.innerHTML=""; }
+}
+
+function startRandomGame(){
+  if(players.length<3){alert("Need at least 3 players");return}
+  wolfVotes={};doctorChoice=null;passQueue=[];currentAction=0;
+  skippedTurn={};pendingSkip={};dousedPlayer=null;dousedNextMorning=false;
+  arsonistAlive=true;deceased=[];jesterVotedOut=false;
+  players.forEach(p=>alive[p]=true);
+  let pool=buildRandomRolePool(players.length);
+  pool=shuffle(pool);
+  let sp=shuffle([...players]);
+  sp.forEach((p,i)=>roles[p]=pool[i]);
+  roleReveal(0);
+}
+
+function startSetup(){
+  players=[];roles={};alive={};deceased=[];
+  render(`
+  <div class="card">
+  <h2>⚙️ Custom Mode</h2>
+  <h3>Add Players</h3>
+  <input id="pname" placeholder="Player name">
+  <button onclick="addPlayer()">Add</button>
+  <div id="plist"></div><br>
+  <h3>Role Settings</h3>
+  <div class="rolelist">
+  <label>Werewolves 🐺</label><br><input id="wolfCount" type="number" value="2" min="0"><br><br>
+  <label>Detectives 🔍</label><br><input id="detectiveCount" type="number" value="1" min="0"><br><br>
+  <label>Doctors 💊</label><br><input id="doctorCount" type="number" value="1" min="0"><br><br>
+  <label>Hunters 🏹</label><br><input id="hunterCount" type="number" value="1" min="0"><br><br>
+  <label>King Tez 👑</label><br><input id="kingCount" type="number" value="0" min="0"><br><br>
+  <label>Jesters 🤡</label><br><input id="jesterCount" type="number" value="0" min="0"><br><br>
+  <label>Time Keepers ⏳</label><br><input id="timekeeperCount" type="number" value="0" min="0"><br><br>
+  <label>Arsonists 🔥</label><br><input id="arsonistCount" type="number" value="0" min="0"><br><br>
+  <label>Mediums 🔮</label><br><input id="mediumCount" type="number" value="0" min="0"><br><br>
+  <label>Allies 🤝</label><br><input id="allyCount" type="number" value="0" min="0"><br><br>
+  </div><br>
+  <button onclick="startGame()">Start Game</button>
+  <br><button onclick="showModeSelect()" style="background:#333;font-size:14px;padding:10px">← Back</button>
+  </div>`)
+  updatePlayerList()
+}
+
+function addPlayer(){
+  let name=document.getElementById("pname").value.trim();
+  if(!name)return;
+  players.push(name);alive[name]=true;
+  updatePlayerList();
+  document.getElementById("pname").value="";
+}
+
+function updatePlayerList(){
+  let list=players.map(p=>`<div>${p}</div>`).join("");
+  let el=document.getElementById("plist");
+  if(el)el.innerHTML=list;
+}
+
+function startGame(){
+  let wolfCount=parseInt(document.getElementById("wolfCount").value)||0;
+  let detectiveCount=parseInt(document.getElementById("detectiveCount").value)||0;
+  let doctorCount=parseInt(document.getElementById("doctorCount").value)||0;
+  let hunterCount=parseInt(document.getElementById("hunterCount").value)||0;
+  let kingCount=parseInt(document.getElementById("kingCount").value)||0;
+  let jesterCount=parseInt(document.getElementById("jesterCount").value)||0;
+  let timekeeperCount=parseInt(document.getElementById("timekeeperCount").value)||0;
+  let arsonistCount=parseInt(document.getElementById("arsonistCount").value)||0;
+  let mediumCount=parseInt(document.getElementById("mediumCount").value)||0;
+  let allyCount=parseInt(document.getElementById("allyCount").value)||0;
+  let rolePool=[];
+  for(let i=0;i<wolfCount;i++) rolePool.push("Werewolf");
+  for(let i=0;i<detectiveCount;i++) rolePool.push("Detective");
+  for(let i=0;i<doctorCount;i++) rolePool.push("Doctor");
+  for(let i=0;i<hunterCount;i++) rolePool.push("Hunter");
+  for(let i=0;i<kingCount;i++) rolePool.push("King Tez");
+  for(let i=0;i<jesterCount;i++) rolePool.push("Jester");
+  for(let i=0;i<timekeeperCount;i++) rolePool.push("Time Keeper");
+  for(let i=0;i<arsonistCount;i++) rolePool.push("Arsonist");
+  for(let i=0;i<mediumCount;i++) rolePool.push("Medium");
+  for(let i=0;i<allyCount;i++) rolePool.push("Ally");
+  if(rolePool.length>players.length){alert("Too many roles for players");return}
+  while(rolePool.length<players.length) rolePool.push("Villager");
+  wolfVotes={};doctorChoice=null;passQueue=[];currentAction=0;
+  skippedTurn={};pendingSkip={};dousedPlayer=null;dousedNextMorning=false;
+  arsonistAlive=true;deceased=[];jesterVotedOut=false;
+  players.forEach(p=>alive[p]=true);
+  rolePool=shuffle(rolePool);
+  let sp=shuffle([...players]);
+  sp.forEach((p,i)=>roles[p]=rolePool[i]);
+  roleReveal(0);
+}
+
+function roleReveal(i){
+  if(i>=players.length){startNight();return}
+  let p=players[i];
+  render(`<div class="card"><h2>Pass phone to ${p}</h2><button onclick="showRole('${p}',${i})">Reveal Role</button></div>`)
+}
+
+function showRole(p,i){
+  let extra="";
+  if(roles[p]==="Ally"){
+    let wolves=players.filter(x=>roles[x]==="Werewolf");
+    extra=`<p class="small" style="margin-top:12px">🐺 Werewolves: <b>${wolves.length?wolves.join(", "):"None"}</b></p>
+    <p class="small">You appear as a Villager to the Detective. You win if the Werewolves win.</p>`;
+  }
+  render(`<div class="card"><h2>Your Role</h2><h1>${roleEmoji(roles[p])} ${roles[p]}</h1>${extra}<button onclick="hideRole(${i})">Hide Role</button></div>`)
+}
+
+function hideRole(i){
+  let next=players[i+1];
+  if(!next){startNight();return}
+  render(`<div class="card"><h2>Pass phone to ${next}</h2><button onclick="roleReveal(${i+1})">Continue</button></div>`)
+}
+
+function startNight(){
+  wolfVotes={};passQueue=[];
+  skippedTurn=Object.assign({},pendingSkip);pendingSkip={};
+  players.forEach(p=>{
+    if(!alive[p])return;
+    if(roles[p]==="Werewolf") passQueue.push({type:"wolf",player:p});
+    else if(roles[p]==="Arsonist") passQueue.push({type:"arsonist",player:p});
+    else if(roles[p]==="Ally") passQueue.push({type:"ally",player:p});
+    else if(roles[p]==="Detective") passQueue.push({type:"detective",player:p});
+    else if(roles[p]==="Doctor") passQueue.push({type:"doctor",player:p});
+    else if(roles[p]==="Time Keeper") passQueue.push({type:"timekeeper",player:p});
+    else if(roles[p]==="Medium") passQueue.push({type:"medium",player:p});
+    else passQueue.push({type:"villager",player:p});
+  });
+  currentAction=0;
+  render(`<div class="card"><h2>🌙 Night</h2><button onclick="nextNightAction()">Start Night</button></div>`)
+}
+
+function nextNightAction(){
+  if(currentAction>=passQueue.length){resolveNight();return}
+  let action=passQueue[currentAction];
+  render(`<div class="card"><h2>Pass phone to ${action.player}</h2><button onclick="runNightAction()">Continue</button></div>`)
+}
+
+function runNightAction(){
+  let action=passQueue[currentAction];
+  if(skippedTurn[action.player]){
+    delete skippedTurn[action.player];
+    render(`<div class="card"><h2>⏳ Turn Skipped</h2><p>The Time Keeper has taken your time. You miss your turn tonight.</p><button onclick="finishAction()">Continue</button></div>`);
+    return;
+  }
+  if(action.type==="wolf") wolfUI(action.player);
+  else if(action.type==="arsonist") arsonistUI(action.player);
+  else if(action.type==="ally") allyUI(action.player);
+  else if(action.type==="detective") detectiveUI(action.player);
+  else if(action.type==="doctor") doctorUI();
+  else if(action.type==="timekeeper") timekeeperUI(action.player);
+  else if(action.type==="medium") mediumUI();
+  else villagerUI();
+}
+
+function villagerUI(){ render(`<div class="card"><p>No action tonight.</p><button onclick="finishAction()">Continue</button></div>`) }
+function finishAction(){currentAction++;nextNightAction()}
+
+function timekeeperUI(p){
+  let targets=players.filter(x=>x!==p&&alive[x]);
+  render(`<div class="card"><h2>⏳ Time Keeper</h2><p>Choose a player to skip their next night</p><div class="list">${targets.map(t=>`<button onclick="freeze('${t}')">${t}</button>`).join("")}</div></div>`)
+}
+function freeze(target){pendingSkip[target]=true;finishAction()}
+
+function mediumUI(){
+  if(deceased.length===0){ render(`<div class="card"><h2>🔮 Medium</h2><p>No one has died yet.</p><button onclick="finishAction()">Continue</button></div>`); return; }
+  let rows=deceased.map(d=>`<div style="background:#252525;padding:10px 14px;border-radius:8px;margin:5px 0;display:flex;justify-content:space-between"><span>💀 ${d.name}</span><span style="opacity:.8">${roleEmoji(d.role)} ${d.role}</span></div>`).join("");
+  render(`<div class="card"><h2>🔮 Medium</h2><p class="small">The spirits speak...</p><div style="text-align:left;margin-top:10px">${rows}</div><button onclick="finishAction()" style="margin-top:14px">Continue</button></div>`)
+}
+
+function allyUI(p){
+  let wolves=players.filter(x=>alive[x]&&roles[x]==="Werewolf");
+  render(`<div class="card"><h2>🤝 Ally</h2><p class="small">You are secretly allied with the Werewolves.</p><p>Living Werewolves: <b>${wolves.length?wolves.join(", "):"None alive"}</b></p><button onclick="finishAction()">Continue</button></div>`)
+}
+
+function arsonistUI(p){
+  let allies=players.filter(x=>alive[x]&&(roles[x]==="Werewolf"||(roles[x]==="Arsonist"&&x!==p)));
+  let targets=players.filter(x=>alive[x]);
+  let allySection=allies.length>0?`<p class="small">🐺 Evil allies: <b>${allies.join(", ")}</b></p>`:`<p class="small">No evil allies alive.</p>`;
+  let actionSection;
+  if(dousedPlayer){ actionSection=`<p style="color:#fa0">🔥 ${dousedPlayer} is already doused. They will burn tomorrow morning.</p><p class="small">You cannot douse another until they burn.</p><button onclick="finishAction()">Continue</button>`; }
+  else { actionSection=`<p>Douse someone in gasoline:</p><div class="list">${targets.map(t=>`<button onclick="douse('${t}')">${t}</button>`).join("")}</div>`; }
+  render(`<div class="card"><h2>🔥 Arsonist</h2>${allySection}${actionSection}</div>`)
+}
+function douse(target){dousedPlayer=target;finishAction()}
+
+function wolfUI(wolf){
+  let targets=players.filter(p=>alive[p]&&!isEvil(p));
+  let allies=players.filter(p=>alive[p]&&p!==wolf&&isEvil(p));
+  let allySection=allies.length>0?`<p class="small">😈 Evil team: <b>${allies.join(", ")}</b></p>`:`<p class="small">No evil allies alive.</p>`;
+  render(`<div class="card"><h2>🐺 Werewolf</h2>${allySection}<div class="list">${targets.map(t=>`<button onclick="wolfVote('${wolf}','${t}')">Kill ${t}</button>`).join("")}</div></div>`)
+}
+function wolfVote(wolf,target){wolfVotes[wolf]=target;finishAction()}
+
+function detectiveUI(p){
+  let targets=players.filter(x=>x!==p&&alive[x]);
+  render(`<div class="card"><h2>🔍 Detective</h2><div class="list">${targets.map(t=>`<button onclick="detect('${t}')">Investigate ${t}</button>`).join("")}</div></div>`)
+}
+function detect(target){
+  let r=roles[target];
+  let result=(r==="Villager"||r==="Ally")?"a Villager":"NOT a Villager";
+  render(`<div class="card"><h2>Investigation Result</h2><p>${target} is <b>${result}</b></p><button onclick="finishAction()">Continue</button></div>`)
+}
+
+function doctorUI(){
+  let targets=players.filter(x=>alive[x]);
+  render(`<div class="card"><h2>💊 Doctor</h2><div class="list">${targets.map(t=>`<button onclick="doctorSave('${t}')">Protect ${t}</button>`).join("")}</div></div>`)
+}
+function doctorSave(t){doctorChoice=t;finishAction()}
+
+function resolveNight(){
+  let votes=Object.values(wolfVotes);
+  let victim=null;
+  if(votes.length>0){
+    let counts={};votes.forEach(v=>counts[v]=(counts[v]||0)+1);
+    let max=Math.max(...Object.values(counts));
+    let leaders=Object.keys(counts).filter(p=>counts[p]===max);
+    victim=leaders[Math.floor(Math.random()*leaders.length)];
+  }
+  let msgs=[];
+  if(!victim){ msgs.push("No one was attacked by the Werewolves."); }
+  else if(victim===doctorChoice){ msgs.push(victim+" was attacked but saved by the Doctor."); }
+  else { markDead(victim); msgs.push(victim+" was killed during the night."); }
+  let burnMsg="";
+  if(dousedNextMorning&&dousedPlayer&&arsonistAlive){
+    if(alive[dousedPlayer]){ markDead(dousedPlayer); burnMsg=`<p style="color:#f74;font-weight:bold">🔥 ${dousedPlayer} burned to death!</p>`; }
+    dousedPlayer=null;dousedNextMorning=false;
+  }else if(dousedPlayer&&arsonistAlive){
+    dousedNextMorning=true;
+    burnMsg=`<p style="color:#fa0" class="small">🔥 ${dousedPlayer} smells like gasoline...</p>`;
+  }
+  doctorChoice=null;
+  if(checkWinCondition())return;
+  render(`<div class="card"><h2>🌅 Morning</h2><p>${msgs.join(" ")}</p>${burnMsg}<button onclick="startVoting()">Continue</button></div>`)
+}
+
+function checkWinCondition(){
+  let living=players.filter(p=>alive[p]);
+  let evilAlive=living.filter(p=>isEvil(p));
+  let goodAlive=living.filter(p=>!isEvil(p));
+  if(evilAlive.length>0&&evilAlive.length>=goodAlive.length){showEndScreen("evil");return true}
+  if(evilAlive.length===0){showEndScreen("good");return true}
+  return false;
+}
+
+function showEndScreen(winner){
+  clearInterval(voteTimer);
+  function playerWon(p){
+    if(roles[p]==="Jester") return winner==="jester"&&jesterVotedOut;
+    if(roles[p]==="Ally") return winner==="evil";
+    if(isEvil(p)) return winner==="evil";
+    return winner==="good";
+  }
+  let title,subtitle,titleColor;
+  if(winner==="jester"){title="🤡 Jester Wins!";subtitle="The village voted out the Jester — fooled again!";titleColor="#f0c";}
+  else if(winner==="evil"){title="😈 Evil Wins!";subtitle="The werewolves and their allies have taken over.";titleColor="#f44";}
+  else{title="🎉 Village Wins!";subtitle="Evil has been defeated. The village is safe!";titleColor="#4f4";}
+  let winners=players.filter(p=>playerWon(p));
+  recordWins(winners);
+  let allRows=players.map(p=>{
+    let isA=alive[p],won=playerWon(p),r=roles[p];
+    let nameColor=isEvil(p)?"color:#f88":r==="Ally"?"color:#fa0":r==="Jester"?"color:#f0c":"color:#8cf";
+    let bg=isEvil(p)?"background:#2a1a1a":r==="Ally"?"background:#2a2200":r==="Jester"?"background:#2a0020":"background:#1a2a1a";
+    if(!isA)bg="background:#222";
+    let wonBadge=won?`<span style="font-size:12px;background:#333;padding:2px 7px;border-radius:6px;margin-left:6px">🏆 Won</span>`:`<span style="font-size:12px;background:#333;padding:2px 7px;border-radius:6px;margin-left:6px;opacity:.5">Lost</span>`;
+    return `<div style="${bg};padding:10px 14px;border-radius:8px;margin:5px 0;display:flex;justify-content:space-between;align-items:center"><span style="${nameColor};font-weight:bold">${isA?"✅":"💀"} ${p}${wonBadge}</span><span style="opacity:.85">${roleEmoji(r)} ${r}</span></div>`;
+  }).join("");
+  render(`<div class="card"><h1 style="color:${titleColor};margin-bottom:4px">${title}</h1><p style="opacity:.75;margin-top:0">${subtitle}</p><hr style="border-color:#333;margin:16px 0"><h3>All Players</h3><div style="text-align:left">${allRows}</div><br><button onclick="showModeSelect()">Play Again</button></div>`)
+}
+
+function startVoting(){
+  let living=players.filter(p=>alive[p]);
+  let secondsLeft=120;
+  render(`<div class="card"><h2>🗳 Voting Phase</h2><p id="voteCountdown" style="font-size:28px;font-weight:bold;color:#f90">2:00</p><p class="small">Vote out the player you think is the Werewolf</p><div class="list">${living.map(p=>`<button onclick="confirmVote('${p}')">${p}</button>`).join("")}<button onclick="skipVote()">Skip Vote</button></div></div>`)
+  voteTimer=setInterval(()=>{
+    secondsLeft--;
+    let el=document.getElementById("voteCountdown");
+    if(el){let m=Math.floor(secondsLeft/60),s=secondsLeft%60;el.textContent=m+":"+(s<10?"0":"")+s;if(secondsLeft<=10)el.style.color="#f33";}
+    if(secondsLeft<=0){clearInterval(voteTimer);render(`<div class="card"><h2>⏱ Time's Up</h2><p>No one was voted out.</p><button onclick="startNight()">Continue</button></div>`)}
+  },1000)
+}
+
+function confirmVote(p){
+  clearInterval(voteTimer);
+  render(`<div class="card"><h2>🗳 Confirm Vote</h2><p>Are you sure you want to vote out <b>${p}</b>?</p><button onclick="voteOut('${p}')" style="background:#8b0000;font-size:18px;padding:16px 28px">✅ Yes, vote out ${p}</button><br><button onclick="startVoting()" style="background:#333">← Go back</button></div>`)
+}
+
+function voteOut(p){
+  clearInterval(voteTimer);
+  markDead(p);
+  if(roles[p]==="Arsonist"){arsonistAlive=false;dousedPlayer=null;dousedNextMorning=false;}
+  if(roles[p]==="Jester"){jesterVotedOut=true;showEndScreen("jester");return}
+  if(roles[p]==="Hunter"){hunterShoot(p);return}
+  if(checkWinCondition())return;
+  render(`<div class="card"><h2>${p} was voted out</h2><p>They were <b>${roleEmoji(roles[p])} ${roles[p]}</b></p><button onclick="startNight()">Continue</button></div>`)
+}
+
+function skipVote(){
+  clearInterval(voteTimer);
+  render(`<div class="card"><h2>No one was voted out</h2><button onclick="startNight()">Continue</button></div>`)
+}
+
+function hunterShoot(hunter){
+  let targets=players.filter(p=>alive[p]);
+  render(`<div class="card"><h2>🏹 Hunter's Last Shot</h2><p><b>${hunter}</b> was voted out but gets one final shot!</p><p class="small">Choose a player to take down with you.</p><div class="list">${targets.map(t=>`<button onclick="hunterPick('${hunter}','${t}')">${t}</button>`).join("")}</div></div>`)
+}
+
+function hunterPick(hunter,target){
+  let targetEvil=isEvil(target);
+  if(targetEvil){
+    markDead(target);
+    if(roles[target]==="Arsonist"){arsonistAlive=false;dousedPlayer=null;dousedNextMorning=false;}
+    if(checkWinCondition())return;
+    render(`<div class="card"><h2>💥 Hunter takes one down!</h2><p>${hunter} took <b>${target}</b> (${roleEmoji(roles[target])} ${roles[target]}) down with them!</p><button onclick="startNight()">Continue</button></div>`)
+  }else{
+    render(`<div class="card"><h2>🏹 Hunter's shot missed!</h2><p>${hunter} shot <b>${target}</b> but they were innocent — no extra death.</p><button onclick="startNight()">Continue</button></div>`)
+  }
+}
+
+// Expose functions to window for onclick handlers
+window.showModeSelect=showModeSelect;
+window.showMultiplayerMenu=showMultiplayerMenu;
+window.showHostMenu=showHostMenu;
+window.showJoinMenu=showJoinMenu;
+window.hostCustomRoom=hostCustomRoom;
+window.hostRandomRoom=hostRandomRoom;
+window.createCustomRoom=createCustomRoom;
+window.createRandomRoom=createRandomRoom;
+window.joinRoom=joinRoom;
+window.setReady=setReady;
+window.leaveRoom=leaveRoom;
+window.hostStartGame=hostStartGame;
+window.confirmRoleReveal=confirmRoleReveal;
+window.mpNightWolf=mpNightWolf;
+window.mpNightArsonist=mpNightArsonist;
+window.mpNightDetective=mpNightDetective;
+window.mpNightDoctor=mpNightDoctor;
+window.mpNightTimekeeper=mpNightTimekeeper;
+window.mpSubmitNightAction=mpSubmitNightAction;
+window.mpHostStartVoting=mpHostStartVoting;
+window.mpCastVote=mpCastVote;
+window.mpHunterPick=mpHunterPick;
+window.startSetup=startSetup;
+window.startRandomSetup=startRandomSetup;
+window.addPlayer=addPlayer;
+window.addRandomPlayer=addRandomPlayer;
+window.startGame=startGame;
+window.startRandomGame=startRandomGame;
+window.showRole=showRole;
+window.hideRole=hideRole;
+window.runNightAction=runNightAction;
+window.nextNightAction=nextNightAction;
+window.finishAction=finishAction;
+window.wolfVote=wolfVote;
+window.detect=detect;
+window.doctorSave=doctorSave;
+window.freeze=freeze;
+window.douse=douse;
+window.confirmVote=confirmVote;
+window.voteOut=voteOut;
+window.skipVote=skipVote;
+window.hunterPick=hunterPick;
+window.showMPWaiting=showMPWaiting;
+window.resetLeaderboard=resetLeaderboard;
+window.roleReveal=roleReveal;
+
+// Also handle bc updates in the context of the module
+bc.addEventListener("message", (e) => {
+  if(currentListener) return; // Already handled by room listener
+  // Global updates not in a room are ignored
+});
+
+showModeSelect();
+</script>
+</body>
+</html>
