@@ -1,0 +1,902 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Werewolf Pass-the-Phone</title>
+<style>
+body{font-family:system-ui;background:#111;color:#fff;margin:0;padding:16px;text-align:center}
+button{padding:14px 18px;margin:8px;font-size:16px;border-radius:10px;border:none;background:#444;color:white}
+button:hover{background:#666}
+.card{background:#1e1e1e;padding:20px;border-radius:14px;margin-top:20px}
+.list button{display:block;width:100%}
+.small{opacity:.7;font-size:14px}
+.rolelist{margin-top:15px;text-align:left}
+.mode-btn{padding:20px 28px;font-size:18px;margin:12px;border-radius:14px;background:#2a2a2a;border:2px solid #555}
+.mode-btn:hover{background:#333;border-color:#aaa}
+.role-preview{background:#2a2a2a;border-radius:10px;padding:12px;margin-top:14px;text-align:left;font-size:14px}
+.role-preview div{padding:3px 0;opacity:.85}
+</style>
+</head>
+<body>
+
+<h1>🐺 Werewolf</h1>
+<div id="app"></div>
+
+<script>
+
+let players=[]
+let roles={}
+let alive={}
+let deceased=[]   // [{name, role}] in order of death
+
+let wolfVotes={}
+let doctorChoice=null
+
+let passQueue=[]
+let currentAction=0
+
+let skippedTurn={}
+let pendingSkip={}
+let dousedPlayer=null
+let dousedNextMorning=false
+let arsonistAlive=true
+let jesterVotedOut=false
+
+let voteTimer=null
+
+const app=document.getElementById("app")
+function render(h){app.innerHTML=h}
+
+/* ---------- HELPERS ---------- */
+
+function isEvil(p){ return roles[p]=="Werewolf"||roles[p]=="Arsonist" }
+
+function roleEmoji(r){
+if(r=="Werewolf")    return "🐺"
+if(r=="Arsonist")    return "🔥"
+if(r=="Detective")   return "🔍"
+if(r=="Doctor")      return "💊"
+if(r=="Hunter")      return "🏹"
+if(r=="King Tez")    return "👑"
+if(r=="Jester")      return "🤡"
+if(r=="Time Keeper") return "⏳"
+if(r=="Medium")      return "🔮"
+if(r=="Ally")        return "🤝"
+return "👤"
+}
+
+function markDead(p){
+if(alive[p]){
+alive[p]=false
+deceased.push({name:p,role:roles[p]})
+}
+}
+
+function shuffle(a){return a.sort(()=>Math.random()-0.5)}
+
+/* ---------- LEADERBOARD ---------- */
+
+function getLeaderboard(){
+try{ return JSON.parse(localStorage.getItem("ww_leaderboard")||"{}") }
+catch(e){ return {} }
+}
+
+function saveLeaderboard(lb){
+localStorage.setItem("ww_leaderboard",JSON.stringify(lb))
+}
+
+function recordWins(names){
+let lb=getLeaderboard()
+names.forEach(n=>{ lb[n]=(lb[n]||0)+1 })
+saveLeaderboard(lb)
+}
+
+function resetLeaderboard(){
+if(confirm("Reset the leaderboard? This cannot be undone.")){
+localStorage.removeItem("ww_leaderboard")
+showModeSelect()
+}
+}
+
+function renderLeaderboard(){
+let lb=getLeaderboard()
+let entries=Object.entries(lb).sort((a,b)=>b[1]-a[1])
+if(entries.length===0) return `<p class="small" style="margin:8px 0;opacity:.4">No games played yet.</p>`
+let medals=["🥇","🥈","🥉"]
+let rows=entries.map(([name,wins],i)=>`
+<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:#252525;border-radius:8px;margin:4px 0">
+<span>${medals[i]||"&nbsp;&nbsp;"} <b>${name}</b></span>
+<span style="background:#333;padding:2px 10px;border-radius:20px;font-weight:bold">${wins} win${wins!==1?"s":""}</span>
+</div>`).join("")
+return `<div style="text-align:left;margin-top:8px">${rows}</div>`
+}
+
+/* ---------- MODE SELECT ---------- */
+
+function showModeSelect(){
+render(`
+<div class="card">
+<h2>Choose Game Mode</h2>
+<br>
+<button class="mode-btn" onclick="startSetup()">⚙️ Custom<br><span class="small" style="font-size:14px">Set your own role counts</span></button>
+<br>
+<button class="mode-btn" onclick="startRandomSetup()">🎲 Random<br><span class="small" style="font-size:14px">Roles are randomly assigned</span></button>
+</div>
+<div class="card">
+<h3 style="margin-top:0">🏆 Leaderboard</h3>
+${renderLeaderboard()}
+<br>
+<button onclick="resetLeaderboard()" style="background:#2a1a1a;color:#f88;font-size:13px;padding:8px 14px">Reset Leaderboard</button>
+</div>
+`)
+}
+
+/* ---------- RANDOM SETUP ---------- */
+
+function startRandomSetup(){
+players=[]
+roles={}
+alive={}
+deceased=[]
+
+render(`
+<div class="card">
+<h2>🎲 Random Mode</h2>
+<p class="small">Add all players, then roles will be randomly assigned.</p>
+<input id="pname" placeholder="Player name">
+<button onclick="addRandomPlayer()">Add</button>
+<div id="plist"></div>
+<br>
+<div id="role-preview"></div>
+<br>
+<button onclick="startRandomGame()">Start Game</button>
+<br>
+<button onclick="showModeSelect()" style="background:#333;font-size:14px;padding:10px">← Back</button>
+</div>
+`)
+updateRandomPlayerList()
+}
+
+function addRandomPlayer(){
+let name=document.getElementById("pname").value.trim()
+if(!name)return
+players.push(name)
+alive[name]=true
+updateRandomPlayerList()
+document.getElementById("pname").value=""
+}
+
+function updateRandomPlayerList(){
+let list=players.map(p=>`<div>${p}</div>`).join("")
+let el=document.getElementById("plist")
+if(el)el.innerHTML=list
+
+let preview=document.getElementById("role-preview")
+if(preview&&players.length>=2){
+let pool=buildRandomRolePool(players.length)
+let counts={}
+pool.forEach(r=>counts[r]=(counts[r]||0)+1)
+let lines=Object.entries(counts).map(([r,n])=>`<div>${roleEmoji(r)} ${r}: <b>${n}</b></div>`).join("")
+preview.innerHTML=`<div class="role-preview"><b>Likely roles (example draw):</b>${lines}</div>`
+}else if(preview){
+preview.innerHTML=""
+}
+}
+
+function buildRandomRolePool(n){
+let pool=[]
+
+// --- EVIL ---
+if(n<=6){
+pool.push(Math.random()<0.5?"Werewolf":"Arsonist")
+}else{
+let r=Math.random()
+if(r<0.50) pool.push("Werewolf")
+else if(r<0.75) pool.push("Werewolf","Arsonist")
+else pool.push("Werewolf","Werewolf")
+}
+
+// --- GOOD: always 1 detective ---
+pool.push("Detective")
+
+// --- OPTIONAL (no King Tez in random) ---
+let optionalRoles=["Doctor","Hunter","Jester","Time Keeper","Medium"]
+shuffle(optionalRoles)
+let extraSlots = n<=5?0 : n<=7?1 : 2
+for(let i=0;i<extraSlots;i++){
+if(optionalRoles[i]) pool.push(optionalRoles[i])
+}
+
+// --- Fill with villagers, then apply 20% chance for ONE Ally — only if exactly 1 evil role ---
+while(pool.length<n) pool.push("Villager")
+
+let evilCount=pool.filter(r=>r=="Werewolf"||r=="Arsonist").length
+if(evilCount===1){
+let villagerIndices=pool.map((r,i)=>r=="Villager"?i:-1).filter(i=>i>=0)
+shuffle(villagerIndices)
+if(villagerIndices.length>0&&Math.random()<0.20){
+pool[villagerIndices[0]]="Ally"
+}
+}
+
+return pool
+}
+
+function startRandomGame(){
+if(players.length<3){alert("Need at least 3 players");return}
+
+// Reset state
+wolfVotes={}; doctorChoice=null; passQueue=[]; currentAction=0
+skippedTurn={}; pendingSkip={}; dousedPlayer=null; dousedNextMorning=false
+arsonistAlive=true; deceased=[]
+jesterVotedOut=false
+players.forEach(p=>alive[p]=true)
+
+let pool=buildRandomRolePool(players.length)
+pool=shuffle(pool)
+let sp=shuffle([...players])
+sp.forEach((p,i)=>roles[p]=pool[i])
+
+roleReveal(0)
+}
+
+/* ---------- CUSTOM SETUP ---------- */
+
+function startSetup(){
+players=[]
+roles={}
+alive={}
+deceased=[]
+
+render(`
+<div class="card">
+<h2>⚙️ Custom Mode</h2>
+<h3>Add Players</h3>
+<input id="pname" placeholder="Player name">
+<button onclick="addPlayer()">Add</button>
+<div id="plist"></div>
+<br>
+<h3>Role Settings</h3>
+<div class="rolelist">
+
+<label>Werewolves 🐺</label><br>
+<input id="wolfCount" type="number" value="2" min="0"><br><br>
+
+<label>Detectives 🔍</label><br>
+<input id="detectiveCount" type="number" value="1" min="0"><br><br>
+
+<label>Doctors 💊</label><br>
+<input id="doctorCount" type="number" value="1" min="0"><br><br>
+
+<label>Hunters 🏹</label><br>
+<input id="hunterCount" type="number" value="1" min="0"><br><br>
+
+<label>King Tez 👑</label><br>
+<input id="kingCount" type="number" value="0" min="0"><br><br>
+
+<label>Jesters 🤡</label><br>
+<input id="jesterCount" type="number" value="0" min="0"><br><br>
+
+<label>Time Keepers ⏳</label><br>
+<input id="timekeeperCount" type="number" value="0" min="0"><br><br>
+
+<label>Arsonists 🔥</label><br>
+<input id="arsonistCount" type="number" value="0" min="0"><br><br>
+
+<label>Mediums 🔮</label><br>
+<input id="mediumCount" type="number" value="0" min="0"><br><br>
+
+<label>Allies 🤝</label><br>
+<input id="allyCount" type="number" value="0" min="0"><br><br>
+
+</div>
+<br>
+<button onclick="startGame()">Start Game</button>
+<br>
+<button onclick="showModeSelect()" style="background:#333;font-size:14px;padding:10px">← Back</button>
+</div>
+`)
+updatePlayerList()
+}
+
+function addPlayer(){
+let name=document.getElementById("pname").value.trim()
+if(!name)return
+players.push(name)
+alive[name]=true
+updatePlayerList()
+document.getElementById("pname").value=""
+}
+
+function updatePlayerList(){
+let list=players.map(p=>`<div>${p}</div>`).join("")
+let el=document.getElementById("plist")
+if(el)el.innerHTML=list
+}
+
+function startGame(){
+let wolfCount      =parseInt(document.getElementById("wolfCount").value)||0
+let detectiveCount =parseInt(document.getElementById("detectiveCount").value)||0
+let doctorCount    =parseInt(document.getElementById("doctorCount").value)||0
+let hunterCount    =parseInt(document.getElementById("hunterCount").value)||0
+let kingCount      =parseInt(document.getElementById("kingCount").value)||0
+let jesterCount    =parseInt(document.getElementById("jesterCount").value)||0
+let timekeeperCount=parseInt(document.getElementById("timekeeperCount").value)||0
+let arsonistCount  =parseInt(document.getElementById("arsonistCount").value)||0
+let mediumCount    =parseInt(document.getElementById("mediumCount").value)||0
+let allyCount      =parseInt(document.getElementById("allyCount").value)||0
+
+let rolePool=[]
+for(let i=0;i<wolfCount;i++)       rolePool.push("Werewolf")
+for(let i=0;i<detectiveCount;i++)  rolePool.push("Detective")
+for(let i=0;i<doctorCount;i++)     rolePool.push("Doctor")
+for(let i=0;i<hunterCount;i++)     rolePool.push("Hunter")
+for(let i=0;i<kingCount;i++)       rolePool.push("King Tez")
+for(let i=0;i<jesterCount;i++)     rolePool.push("Jester")
+for(let i=0;i<timekeeperCount;i++) rolePool.push("Time Keeper")
+for(let i=0;i<arsonistCount;i++)   rolePool.push("Arsonist")
+for(let i=0;i<mediumCount;i++)     rolePool.push("Medium")
+for(let i=0;i<allyCount;i++)       rolePool.push("Ally")
+
+if(rolePool.length>players.length){alert("Too many roles for players");return}
+while(rolePool.length<players.length) rolePool.push("Villager")
+
+// Reset state
+wolfVotes={}; doctorChoice=null; passQueue=[]; currentAction=0
+skippedTurn={}; pendingSkip={}; dousedPlayer=null; dousedNextMorning=false
+arsonistAlive=true; deceased=[]
+jesterVotedOut=false
+players.forEach(p=>alive[p]=true)
+
+rolePool=shuffle(rolePool)
+let sp=shuffle([...players])
+sp.forEach((p,i)=>roles[p]=rolePool[i])
+
+roleReveal(0)
+}
+
+/* ---------- ROLE REVEAL ---------- */
+
+function roleReveal(i){
+if(i>=players.length){startNight();return}
+let p=players[i]
+render(`
+<div class="card">
+<h2>Pass phone to ${p}</h2>
+<button onclick="showRole('${p}',${i})">Reveal Role</button>
+</div>
+`)
+}
+
+function showRole(p,i){
+// For Ally: reveal the wolves
+let extra=""
+if(roles[p]=="Ally"){
+let wolves=players.filter(x=>roles[x]=="Werewolf")
+extra=`<p class="small" style="margin-top:12px">🐺 Werewolves: <b>${wolves.length?wolves.join(", "):"None"}</b></p>
+<p class="small">You appear as a Villager to the Detective. You win if the Werewolves win.</p>`
+}
+render(`
+<div class="card">
+<h2>Your Role</h2>
+<h1>${roleEmoji(roles[p])} ${roles[p]}</h1>
+${extra}
+<button onclick="hideRole(${i})">Hide Role</button>
+</div>
+`)
+}
+
+function hideRole(i){
+let next=players[i+1]
+if(!next){startNight();return}
+render(`
+<div class="card">
+<h2>Pass phone to ${next}</h2>
+<button onclick="roleReveal(${i+1})">Continue</button>
+</div>
+`)
+}
+
+/* ---------- NIGHT ---------- */
+
+function startNight(){
+wolfVotes={}
+passQueue=[]
+skippedTurn=Object.assign({},pendingSkip)
+pendingSkip={}
+
+players.forEach(p=>{
+if(!alive[p]) return
+if(roles[p]=="Werewolf")    passQueue.push({type:"wolf",player:p})
+else if(roles[p]=="Arsonist")    passQueue.push({type:"arsonist",player:p})
+else if(roles[p]=="Ally")        passQueue.push({type:"ally",player:p})
+else if(roles[p]=="Detective")   passQueue.push({type:"detective",player:p})
+else if(roles[p]=="Doctor")      passQueue.push({type:"doctor",player:p})
+else if(roles[p]=="Time Keeper") passQueue.push({type:"timekeeper",player:p})
+else if(roles[p]=="Medium")      passQueue.push({type:"medium",player:p})
+else                             passQueue.push({type:"villager",player:p})
+})
+
+currentAction=0
+render(`
+<div class="card">
+<h2>🌙 Night</h2>
+<button onclick="nextNightAction()">Start Night</button>
+</div>
+`)
+}
+
+function nextNightAction(){
+if(currentAction>=passQueue.length){resolveNight();return}
+let action=passQueue[currentAction]
+render(`
+<div class="card">
+<h2>Pass phone to ${action.player}</h2>
+<button onclick="runNightAction()">Continue</button>
+</div>
+`)
+}
+
+function runNightAction(){
+let action=passQueue[currentAction]
+
+if(skippedTurn[action.player]){
+delete skippedTurn[action.player]
+render(`
+<div class="card">
+<h2>⏳ Time Keeper has taken your time</h2>
+<p>The Time Keeper has taken your time. You miss your turn tonight.</p>
+<button onclick="finishAction()">Continue</button>
+</div>
+`)
+return
+}
+
+if(action.type=="wolf")        wolfUI(action.player)
+else if(action.type=="arsonist")    arsonistUI(action.player)
+else if(action.type=="ally")        allyUI(action.player)
+else if(action.type=="detective")   detectiveUI(action.player)
+else if(action.type=="doctor")      doctorUI()
+else if(action.type=="timekeeper")  timekeeperUI(action.player)
+else if(action.type=="medium")      mediumUI()
+else                                villagerUI()
+}
+
+function villagerUI(){
+render(`
+<div class="card">
+<p>No action tonight.</p>
+<button onclick="finishAction()">Continue</button>
+</div>
+`)
+}
+
+function finishAction(){currentAction++;nextNightAction()}
+
+/* ---------- TIME KEEPER ---------- */
+
+function timekeeperUI(p){
+let targets=players.filter(x=>x!==p&&alive[x])
+render(`
+<div class="card">
+<h2>⏳ Time Keeper</h2>
+<p>Choose a player to skip their next night</p>
+<div class="list">
+${targets.map(t=>`<button onclick="freeze('${t}')">${t}</button>`).join("")}
+</div>
+</div>
+`)
+}
+
+function freeze(target){pendingSkip[target]=true;finishAction()}
+
+/* ---------- MEDIUM ---------- */
+
+function mediumUI(){
+if(deceased.length===0){
+render(`
+<div class="card">
+<h2>🔮 Medium</h2>
+<p>No one has died yet.</p>
+<button onclick="finishAction()">Continue</button>
+</div>
+`)
+return
+}
+let rows=deceased.map(d=>`
+<div style="background:#252525;padding:10px 14px;border-radius:8px;margin:5px 0;display:flex;justify-content:space-between">
+<span>💀 ${d.name}</span>
+<span style="opacity:.8">${roleEmoji(d.role)} ${d.role}</span>
+</div>`).join("")
+render(`
+<div class="card">
+<h2>🔮 Medium</h2>
+<p class="small">The spirits speak...</p>
+<div style="text-align:left;margin-top:10px">${rows}</div>
+<button onclick="finishAction()" style="margin-top:14px">Continue</button>
+</div>
+`)
+}
+
+/* ---------- ALLY ---------- */
+
+function allyUI(p){
+let wolves=players.filter(x=>alive[x]&&roles[x]=="Werewolf")
+render(`
+<div class="card">
+<h2>🤝 Ally</h2>
+<p class="small">You are secretly allied with the Werewolves.</p>
+<p>Living Werewolves: <b>${wolves.length?wolves.join(", "):"None alive"}</b></p>
+<button onclick="finishAction()">Continue</button>
+</div>
+`)
+}
+
+/* ---------- ARSONIST ---------- */
+
+function arsonistUI(p){
+let allies=players.filter(x=>alive[x]&&(roles[x]=="Werewolf"||(roles[x]=="Arsonist"&&x!==p)))
+let targets=players.filter(x=>alive[x])
+
+let allySection=allies.length>0
+?`<p class="small">🐺 Evil allies: <b>${allies.join(", ")}</b></p>`
+:`<p class="small">You have no evil allies alive.</p>`
+
+let actionSection
+if(dousedPlayer){
+actionSection=`<p style="color:#fa0">🔥 ${dousedPlayer} is already doused. They will burn tomorrow morning.</p>
+<p class="small">You cannot douse another player until they burn.</p>
+<button onclick="finishAction()">Continue</button>`
+}else{
+actionSection=`<p>Douse someone in gasoline — they will burn the following morning.</p>
+<div class="list">${targets.map(t=>`<button onclick="douse('${t}')">${t}</button>`).join("")}</div>`
+}
+
+render(`
+<div class="card">
+<h2>🔥 Arsonist</h2>
+${allySection}
+${actionSection}
+</div>
+`)
+}
+
+function douse(target){dousedPlayer=target;finishAction()}
+
+/* ---------- WEREWOLF ---------- */
+
+function wolfUI(wolf){
+let targets=players.filter(p=>alive[p]&&!isEvil(p))
+let allies=players.filter(p=>alive[p]&&p!==wolf&&isEvil(p))
+let allySection=allies.length>0
+?`<p class="small">😈 Evil team: <b>${allies.join(", ")}</b></p>`
+:`<p class="small">You have no evil allies alive.</p>`
+render(`
+<div class="card">
+<h2>🐺 Werewolf</h2>
+${allySection}
+<div class="list">${targets.map(t=>`<button onclick="wolfVote('${wolf}','${t}')">Kill ${t}</button>`).join("")}</div>
+</div>
+`)
+}
+
+function wolfVote(wolf,target){wolfVotes[wolf]=target;finishAction()}
+
+/* ---------- DETECTIVE ---------- */
+
+function detectiveUI(p){
+let targets=players.filter(x=>x!==p&&alive[x])
+render(`
+<div class="card">
+<h2>🔍 Detective</h2>
+<div class="list">${targets.map(t=>`<button onclick="detect('${t}')">Investigate ${t}</button>`).join("")}</div>
+</div>
+`)
+}
+
+function detect(target){
+// Ally shows as Villager to detective
+let r=roles[target]
+let result=(r=="Villager"||r=="Ally")?"a Villager":"NOT a Villager"
+render(`
+<div class="card">
+<h2>Investigation Result</h2>
+<p>${target} is <b>${result}</b></p>
+<button onclick="finishAction()">Continue</button>
+</div>
+`)
+}
+
+/* ---------- DOCTOR ---------- */
+
+function doctorUI(){
+let targets=players.filter(x=>alive[x])
+render(`
+<div class="card">
+<h2>💊 Doctor</h2>
+<div class="list">${targets.map(t=>`<button onclick="doctorSave('${t}')">Protect ${t}</button>`).join("")}</div>
+</div>
+`)
+}
+
+function doctorSave(t){doctorChoice=t;finishAction()}
+
+/* ---------- NIGHT RESOLUTION ---------- */
+
+function resolveNight(){
+let votes=Object.values(wolfVotes)
+let victim=null
+
+if(votes.length>0){
+let counts={}
+votes.forEach(v=>counts[v]=(counts[v]||0)+1)
+let max=Math.max(...Object.values(counts))
+let leaders=Object.keys(counts).filter(p=>counts[p]==max)
+victim=leaders[Math.floor(Math.random()*leaders.length)]
+}
+
+let msgs=[]
+
+if(!victim){
+msgs.push("No one was attacked by the Werewolves.")
+}else if(victim==doctorChoice){
+msgs.push(victim+" was attacked but saved by the Doctor.")
+}else{
+markDead(victim)
+msgs.push(victim+" was killed during the night.")
+}
+
+let burnMsg=""
+if(dousedNextMorning&&dousedPlayer&&arsonistAlive){
+if(alive[dousedPlayer]){
+markDead(dousedPlayer)
+burnMsg=`<p style="color:#f74;font-weight:bold">🔥 ${dousedPlayer} burned to death!</p>`
+}
+dousedPlayer=null
+dousedNextMorning=false
+}else if(dousedPlayer&&arsonistAlive){
+dousedNextMorning=true
+burnMsg=`<p style="color:#fa0" class="small">🔥 ${dousedPlayer} smells like gasoline...</p>`
+}
+
+doctorChoice=null
+
+if(checkWinCondition()) return
+
+render(`
+<div class="card">
+<h2>🌅 Morning</h2>
+<p>${msgs.join(" ")}</p>
+${burnMsg}
+<button onclick="startVoting()">Continue</button>
+</div>
+`)
+}
+
+/* ---------- WIN CONDITION ---------- */
+
+function checkWinCondition(){
+let living=players.filter(p=>alive[p])
+let evilAlive=living.filter(p=>isEvil(p))
+let goodAlive=living.filter(p=>!isEvil(p))
+
+if(evilAlive.length>0&&evilAlive.length>=goodAlive.length){
+showEndScreen("evil")
+return true
+}
+if(evilAlive.length===0){
+// Check if any wolves existed at all — if so, Ally loses
+showEndScreen("good")
+return true
+}
+return false
+}
+
+function showEndScreen(winner){
+clearInterval(voteTimer)
+
+function playerWon(p){
+if(roles[p]=="Jester") return winner==="jester" && jesterVotedOut
+if(roles[p]=="Ally") return winner==="evil"
+if(isEvil(p)) return winner==="evil"
+return winner==="good"
+}
+
+let title,subtitle,titleColor
+if(winner==="jester"){
+title="🤡 Jester Wins!"
+subtitle="The village voted out the Jester — fooled again!"
+titleColor="#f0c"
+}else if(winner==="evil"){
+title="😈 Evil Wins!"
+subtitle="The werewolves and their allies have taken over the village."
+titleColor="#f44"
+}else{
+title="🎉 Village Wins!"
+subtitle="The evil has been defeated. The village is safe!"
+titleColor="#4f4"
+}
+
+// Record wins into leaderboard
+let winners=players.filter(p=>playerWon(p))
+recordWins(winners)
+
+let allRows=players.map(p=>{
+let isA=alive[p]
+let won=playerWon(p)
+let status=isA?"✅":"💀"
+let r=roles[p]
+let nameColor=isEvil(p)?"color:#f88":r=="Ally"?"color:#fa0":r=="Jester"?"color:#f0c":"color:#8cf"
+let bg=isEvil(p)?"background:#2a1a1a":r=="Ally"?"background:#2a2200":r=="Jester"?"background:#2a0020":"background:#1a2a1a"
+if(!isA) bg="background:#222"
+let wonBadge=won?`<span style="font-size:12px;background:#333;padding:2px 7px;border-radius:6px;margin-left:6px">🏆 Won</span>`
+:`<span style="font-size:12px;background:#333;padding:2px 7px;border-radius:6px;margin-left:6px;opacity:.5">Lost</span>`
+return `<div style="${bg};padding:10px 14px;border-radius:8px;margin:5px 0;display:flex;justify-content:space-between;align-items:center">
+<span style="${nameColor};font-weight:bold">${status} ${p}${wonBadge}</span>
+<span style="opacity:.85">${roleEmoji(r)} ${r}</span>
+</div>`
+}).join("")
+
+render(`
+<div class="card">
+<h1 style="color:${titleColor};margin-bottom:4px">${title}</h1>
+<p style="opacity:.75;margin-top:0">${subtitle}</p>
+<hr style="border-color:#333;margin:16px 0">
+<h3 style="margin-bottom:10px">All Players</h3>
+<div style="text-align:left">${allRows}</div>
+<br>
+<button onclick="showModeSelect()">Play Again</button>
+</div>
+`)
+}
+
+/* ---------- DAY VOTING ---------- */
+
+function startVoting(){
+let living=players.filter(p=>alive[p])
+let secondsLeft=120
+
+render(`
+<div class="card">
+<h2>🗳 Voting Phase</h2>
+<p id="voteCountdown" style="font-size:28px;font-weight:bold;color:#f90">2:00</p>
+<p class="small">Vote out the player you think is the Werewolf</p>
+<div class="list">
+${living.map(p=>`<button onclick="confirmVote('${p}')">${p}</button>`).join("")}
+<button onclick="skipVote()">Skip Vote</button>
+</div>
+</div>
+`)
+
+voteTimer=setInterval(()=>{
+secondsLeft--
+let el=document.getElementById("voteCountdown")
+if(el){
+let m=Math.floor(secondsLeft/60)
+let s=secondsLeft%60
+el.textContent=m+":"+(s<10?"0":"")+s
+if(secondsLeft<=10) el.style.color="#f33"
+}
+if(secondsLeft<=0){
+clearInterval(voteTimer)
+render(`
+<div class="card">
+<h2>⏱ Time's Up</h2>
+<p>No one was voted out.</p>
+<button onclick="startNight()">Continue</button>
+</div>
+`)
+}
+},1000)
+}
+
+function confirmVote(p){
+clearInterval(voteTimer)
+render(`
+<div class="card">
+<h2>🗳 Confirm Vote</h2>
+<p>Are you sure you want to vote out <b>${p}</b>?</p>
+<button onclick="voteOut('${p}')" style="background:#8b0000;font-size:18px;padding:16px 28px">✅ Yes, vote out ${p}</button>
+<br>
+<button onclick="startVoting()" style="background:#333">← Go back</button>
+</div>
+`)
+}
+
+function voteOut(p){
+clearInterval(voteTimer)
+
+markDead(p)
+
+if(roles[p]=="Arsonist"){
+arsonistAlive=false
+dousedPlayer=null
+dousedNextMorning=false
+}
+
+// Jester wins if voted out
+if(roles[p]=="Jester"){
+jesterVotedOut=true
+showEndScreen("jester")
+return
+}
+
+// Hunter ability: gets to shoot someone before dying
+if(roles[p]=="Hunter"){
+hunterShoot(p)
+return
+}
+
+if(checkWinCondition()) return
+
+render(`
+<div class="card">
+<h2>${p} was voted out</h2>
+<p>They were <b>${roleEmoji(roles[p])} ${roles[p]}</b></p>
+<button onclick="startNight()">Continue</button>
+</div>
+`)
+}
+
+function skipVote(){
+clearInterval(voteTimer)
+render(`
+<div class="card">
+<h2>No one was voted out</h2>
+<button onclick="startNight()">Continue</button>
+</div>
+`)
+}
+
+/* ---------- HUNTER ---------- */
+
+function hunterShoot(hunter){
+let targets=players.filter(p=>alive[p])
+render(`
+<div class="card">
+<h2>🏹 Hunter's Last Shot</h2>
+<p><b>${hunter}</b> was voted out but gets one final shot!</p>
+<p class="small">Choose a player to take down with you. If you pick an evil player, they die too.</p>
+<div class="list">
+${targets.map(t=>`<button onclick="hunterPick('${hunter}','${t}')">${t}</button>`).join("")}
+</div>
+</div>
+`)
+}
+
+function hunterPick(hunter,target){
+let targetEvil=isEvil(target)
+
+if(targetEvil){
+markDead(target)
+if(roles[target]=="Arsonist"){
+arsonistAlive=false
+dousedPlayer=null
+dousedNextMorning=false
+}
+if(checkWinCondition()) return
+render(`
+<div class="card">
+<h2>💥 Hunter takes one down!</h2>
+<p>${hunter} was voted out and took <b>${target}</b> (${roleEmoji(roles[target])} ${roles[target]}) down with them!</p>
+<button onclick="startNight()">Continue</button>
+</div>
+`)
+}else{
+render(`
+<div class="card">
+<h2>🏹 Hunter's shot missed!</h2>
+<p>${hunter} shot <b>${target}</b> but they were innocent — no extra death.</p>
+<button onclick="startNight()">Continue</button>
+</div>
+`)
+}
+}
+
+showModeSelect()
+
+</script>
+
+</body>
+</html>
