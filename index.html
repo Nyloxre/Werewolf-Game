@@ -253,7 +253,7 @@ const WS_URL = (()=>{
   const h=window.location.hostname
   if(h==='localhost'||h==='127.0.0.1') return 'ws://localhost:8080'
   return 'wss://werewolf-game-f5on.onrender.com'
-})()
+})() 
 
 function connectWS(onOpen){
   render(`<div class="card"><p>Connecting to server…</p><p class="small">${WS_URL}</p></div>`)
