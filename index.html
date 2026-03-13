@@ -252,7 +252,7 @@ function joinRoom(){
 const WS_URL = (()=>{
   const h=window.location.hostname
   if(h==='localhost'||h==='127.0.0.1') return 'ws://localhost:8080'
-  return 'wss://https://werewolf-game-f5on.onrender.com'
+  return 'wss://werewolf-game-f5on.onrender.com'
 })()
 
 function connectWS(onOpen){
